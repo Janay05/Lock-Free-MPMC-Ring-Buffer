@@ -1,0 +1,57 @@
+# Build directories
+build/
+bin/
+out/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+
+# Object and library files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debugging and symbols
+*.pdb
+*.ilk
+*.idb
+*.exp
+
+# Profiling and performance data
+gmon.out
+perf.data
+perf.data.old
+*.profdata
+*.profraw
+
+# IDE and Editor files
+.vscode/
+.idea/
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
