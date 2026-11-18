@@ -17,15 +17,16 @@
 
 namespace mpmc {
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform-portable aligned allocation helpers
+// ─────────────────────────────────────────────────────────────────────────────
 namespace detail {
     inline void* aligned_alloc_64(std::size_t bytes) noexcept {
 #if defined(_WIN32)
         return _aligned_malloc(bytes, kCacheLineSize);
 #else
         void* ptr = nullptr;
-        if (posix_memalign(&ptr, kCacheLineSize, bytes) != 0) {
-            return nullptr;
-        }
+        if (posix_memalign(&ptr, kCacheLineSize, bytes) != 0) return nullptr;
         return ptr;
 #endif
     }
@@ -39,69 +40,70 @@ namespace detail {
     }
 } // namespace detail
 
-/**
- * Lock-Free Multi-Producer Multi-Consumer (MPMC) Ring Buffer.
- *
- * Key Latency & Throughput Optimizations:
- * 1. False Sharing Elimination:
- *    - Each Slot is 64 bytes (1 cache line).
- *    - head_ and tail_ are separated onto their own distinct cache lines.
- *    - Read-mostly control data is isolated from mutable atomics.
- * 2. Pure User-Space Lock-Free:
- *    - No kernel synchronization primitives (no mutex, no futex, no semaphores).
- *    - CAS loops with pure hardware _mm_pause hints, zero OS preemption or syscalls.
- * 3. Power-of-2 Bitmasking:
- *    - pos & mask_ replaces CPU integer division (idiv is ~40-80 cycles, and is 1 cycle).
- * 4. Hardware Memory Prefetching:
- *    - Prefetches next slot into L1 cache ahead of time to overlap memory latency.
- * 5. Minimal Cache-Coherency Invalidation:
- *    - CAS on sequence handshake rather than contending on a single global lock.
- */
-template <typename T = void, std::size_t Capacity = 1024>
-class RingBuffer {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RingBufferBase — CRTP base containing all shared CAS mechanics
+//
+// Derived classes implement two policy hooks via static dispatch (no vtable):
+//
+//   bool on_full(T* item)   — called when try_enqueue finds the queue full.
+//                             Return true  → retry (Derived handled it).
+//                             Return false → caller receives false immediately.
+//
+//   bool on_empty(T*& out)  — called when try_dequeue finds the queue empty.
+//                             Return true  → retry (Derived handled it).
+//                             Return false → caller receives false immediately.
+//
+// All Derived::on_full / on_empty calls are inlined at compile time.
+// Zero virtual dispatch, zero vtable pointer in the object.
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename Derived, typename T, std::size_t Capacity>
+class RingBufferBase {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
-    static_assert(Capacity >= 2, "Capacity must be at least 2");
+    static_assert(Capacity >= 2,                    "Capacity must be at least 2");
 
 public:
     using value_type = T*;
 
-    explicit RingBuffer() {
-        std::size_t alloc_size = sizeof(Slot<T>) * Capacity;
-        slots_ = static_cast<Slot<T>*>(detail::aligned_alloc_64(alloc_size));
-        if (!slots_) {
-            throw std::bad_alloc();
-        }
+    explicit RingBufferBase() {
+        slots_ = static_cast<Slot<T>*>(
+            detail::aligned_alloc_64(sizeof(Slot<T>) * Capacity));
+        if (!slots_) throw std::bad_alloc();
 
-        // Initialize slots: sequence for slot i is set to i.
-        // This ensures the producer for turn 0 sees seq == pos.
         for (std::size_t i = 0; i < Capacity; ++i) {
             new (&slots_[i]) Slot<T>();
             slots_[i].sequence.store(i, std::memory_order_relaxed);
         }
-
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
     }
 
-    ~RingBuffer() noexcept {
+    ~RingBufferBase() noexcept {
         if (slots_) {
-            for (std::size_t i = 0; i < Capacity; ++i) {
-                slots_[i].~Slot<T>();
-            }
+            for (std::size_t i = 0; i < Capacity; ++i) slots_[i].~Slot<T>();
             detail::aligned_free_64(slots_);
             slots_ = nullptr;
         }
     }
 
-    // Non-copyable, non-movable to ensure cache-pinned addresses
-    RingBuffer(const RingBuffer&) = delete;
-    RingBuffer& operator=(const RingBuffer&) = delete;
-    RingBuffer(RingBuffer&&) = delete;
-    RingBuffer& operator=(RingBuffer&&) = delete;
+    RingBufferBase(const RingBufferBase&)            = delete;
+    RingBufferBase& operator=(const RingBufferBase&) = delete;
+    RingBufferBase(RingBufferBase&&)                 = delete;
+    RingBufferBase& operator=(RingBufferBase&&)      = delete;
 
+    // ── Core enqueue ─────────────────────────────────────────────────────────
     /**
-     * Non-blocking attempt to enqueue an item.
-     * Returns true if successfully enqueued, false if queue was full or contended.
+     * Non-blocking single-item enqueue.
+     *
+     * When the queue is full, calls Derived::on_full(item):
+     *   - Returns false immediately (DropPolicy)
+     *   - Spins with _mm_pause (SpinningPolicy)
+     *   - Advances tail to overwrite oldest item (OverwritePolicy)
+     *
+     * Memory ordering:
+     *   slot.sequence load   : acquire  — synchronise with prior release store
+     *   head_ CAS            : relaxed  — sequence handshake provides ordering
+     *   slot.sequence store  : release  — publish written data to consumers
      */
     [[nodiscard]] bool try_enqueue(T* item) noexcept {
         std::size_t pos = head_.load(std::memory_order_relaxed);
@@ -109,81 +111,97 @@ public:
         for (;;) {
             Slot<T>* slot = &slots_[pos & kMask];
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
-            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+            intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
 
             if (__builtin_expect(diff == 0, 1)) {
-                // Slot is ready for our turn. Attempt to claim head.
-                if (head_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    // Prefetch the NEXT slot into L1 for writing
+                // Fast path: slot is ready. Race to claim it.
+                if (head_.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
                     cache::prefetch_write(&slots_[(pos + 1) & kMask]);
-
                     slot->data = item;
-                    // Publish: release ensures slot->data write is visible before sequence updates
                     slot->sequence.store(pos + 1, std::memory_order_release);
                     return true;
                 }
-                // CAS failed: pos was updated by compare_exchange_weak with current head value.
+                // CAS failed — pos now holds the refreshed head; retry.
             } else if (diff < 0) {
-                // Buffer is full (or pos was stale). Verify if head has moved.
-                std::size_t current_head = head_.load(std::memory_order_relaxed);
-                if (current_head != pos) {
-                    pos = current_head;
-                } else {
-                    return false; // Queue is full
+                // Queue is full. Delegate to policy.
+                if (derived().on_full(item, pos)) {
+                    // Policy handled it (e.g. overwrite advanced tail).
+                    // Reload head and retry the outer loop.
+                    pos = head_.load(std::memory_order_relaxed);
+                    continue;
                 }
+                return false;
             } else {
-                // Another producer won this slot; re-read head
+                // Another producer claimed this slot; reload head and retry.
                 pos = head_.load(std::memory_order_relaxed);
             }
         }
     }
 
+    // ── Core dequeue ─────────────────────────────────────────────────────────
     /**
-     * Pure spin-wait enqueue. Zero OS scheduler calls.
-     * Spins strictly in user-space with hardware _mm_pause until a slot is claimed.
+     * Non-blocking single-item dequeue.
+     *
+     * When the queue is empty, calls Derived::on_empty(out):
+     *   - Returns false immediately (DropPolicy / OverwritePolicy)
+     *   - Spins with _mm_pause (SpinningPolicy)
      */
-    void enqueue(T* item) noexcept {
-        SpinWait backoff;
-        while (!try_enqueue(item)) {
-            backoff.spin();
+    [[nodiscard]] bool try_dequeue(T*& out_item) noexcept {
+        std::size_t pos = tail_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            Slot<T>* slot = &slots_[pos & kMask];
+            std::size_t seq = slot->sequence.load(std::memory_order_acquire);
+            intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+
+            if (__builtin_expect(diff == 0, 1)) {
+                if (tail_.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    cache::prefetch_read(&slots_[(pos + 1) & kMask]);
+                    out_item = slot->data;
+                    slot->sequence.store(pos + kMask + 1, std::memory_order_release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                if (derived().on_empty(out_item, pos)) {
+                    pos = tail_.load(std::memory_order_relaxed);
+                    continue;
+                }
+                return false;
+            } else {
+                pos = tail_.load(std::memory_order_relaxed);
+            }
         }
     }
 
+    // ── Bulk enqueue ─────────────────────────────────────────────────────────
     /**
-     * Bulk enqueue: Claim up to `max_count` slots in a single atomic CAS operation.
-     * Amortizes the CAS instruction and cache invalidation over `to_claim` items.
-     * Returns the actual number of items successfully enqueued.
+     * Claim up to max_count slots with a single head_ CAS.
+     * Amortises bus-lock cost across the batch.
      */
-    [[nodiscard]] std::size_t try_enqueue_bulk(T* const* items, std::size_t max_count) noexcept {
-        if (__builtin_expect(max_count == 0, 0)) {
-            return 0;
-        }
+    [[nodiscard]] std::size_t try_enqueue_bulk(T* const* items,
+                                                std::size_t max_count) noexcept {
+        if (__builtin_expect(max_count == 0, 0)) return 0;
 
         std::size_t pos = head_.load(std::memory_order_relaxed);
 
         for (;;) {
             std::size_t current_tail = tail_.load(std::memory_order_relaxed);
-            std::size_t occupied = pos - current_tail;
-            if (occupied >= Capacity) {
-                return 0; // Buffer is completely full
-            }
+            std::size_t occupied     = pos - current_tail;
+            if (occupied >= Capacity) return 0;
 
             std::size_t available = Capacity - occupied;
-            std::size_t to_claim = (max_count < available) ? max_count : available;
-            if (to_claim == 0) {
-                return 0;
-            }
+            std::size_t to_claim  = (max_count < available) ? max_count : available;
+            if (to_claim == 0) return 0;
 
-            if (head_.compare_exchange_weak(pos, pos + to_claim, std::memory_order_relaxed)) {
+            if (head_.compare_exchange_weak(pos, pos + to_claim,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    std::size_t slot_idx = (pos + i) & kMask;
-                    Slot<T>* slot = &slots_[slot_idx];
-
-                    SpinWait backoff;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i)) {
-                        backoff.spin();
-                    }
-
+                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SpinWait bk;
+                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
+                        bk.spin();
                     slot->data = items[i];
                     slot->sequence.store(pos + i + 1, std::memory_order_release);
                 }
@@ -192,78 +210,28 @@ public:
         }
     }
 
-    /**
-     * Non-blocking attempt to dequeue an item.
-     * Returns true and sets out_item if successful, false if queue is empty.
-     */
-    [[nodiscard]] bool try_dequeue(T*& out_item) noexcept {
-        std::size_t pos = tail_.load(std::memory_order_relaxed);
-
-        for (;;) {
-            Slot<T>* slot = &slots_[pos & kMask];
-            std::size_t seq = slot->sequence.load(std::memory_order_acquire);
-            intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
-
-            if (__builtin_expect(diff == 0, 1)) {
-                // Slot has data ready for our turn. Attempt to claim tail.
-                if (tail_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    // Prefetch the NEXT slot into L1 for reading
-                    cache::prefetch_read(&slots_[(pos + 1) & kMask]);
-
-                    out_item = slot->data;
-                    // Release slot for next cycle (pos + Capacity)
-                    slot->sequence.store(pos + kMask + 1, std::memory_order_release);
-                    return true;
-                }
-                // CAS failed: pos was updated with current tail value.
-            } else if (diff < 0) {
-                // Buffer is empty (or pos was stale). Verify if tail has moved.
-                std::size_t current_tail = tail_.load(std::memory_order_relaxed);
-                if (current_tail != pos) {
-                    pos = current_tail;
-                } else {
-                    return false; // Queue is empty
-                }
-            } else {
-                // Another consumer won this slot; re-read tail
-                pos = tail_.load(std::memory_order_relaxed);
-            }
-        }
-    }
-
-    /**
-     * Bulk dequeue: Claim up to `max_count` slots in a single atomic CAS operation.
-     * Returns the actual number of items successfully dequeued.
-     */
-    [[nodiscard]] std::size_t try_dequeue_bulk(T** out_items, std::size_t max_count) noexcept {
-        if (__builtin_expect(max_count == 0, 0)) {
-            return 0;
-        }
+    // ── Bulk dequeue ─────────────────────────────────────────────────────────
+    [[nodiscard]] std::size_t try_dequeue_bulk(T** out_items,
+                                                std::size_t max_count) noexcept {
+        if (__builtin_expect(max_count == 0, 0)) return 0;
 
         std::size_t pos = tail_.load(std::memory_order_relaxed);
 
         for (;;) {
             std::size_t current_head = head_.load(std::memory_order_relaxed);
-            if (pos >= current_head) {
-                return 0; // Buffer is empty
-            }
+            if (pos >= current_head) return 0;
 
             std::size_t available = current_head - pos;
-            std::size_t to_claim = (max_count < available) ? max_count : available;
-            if (to_claim == 0) {
-                return 0;
-            }
+            std::size_t to_claim  = (max_count < available) ? max_count : available;
+            if (to_claim == 0) return 0;
 
-            if (tail_.compare_exchange_weak(pos, pos + to_claim, std::memory_order_relaxed)) {
+            if (tail_.compare_exchange_weak(pos, pos + to_claim,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    std::size_t slot_idx = (pos + i) & kMask;
-                    Slot<T>* slot = &slots_[slot_idx];
-
-                    SpinWait backoff;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1)) {
-                        backoff.spin();
-                    }
-
+                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SpinWait bk;
+                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
+                        bk.spin();
                     out_items[i] = slot->data;
                     slot->sequence.store(pos + i + kMask + 1, std::memory_order_release);
                 }
@@ -272,51 +240,177 @@ public:
         }
     }
 
-    /**
-     * Pure spin-wait dequeue. Zero OS scheduler calls.
-     * Spins strictly in user-space with hardware _mm_pause until an item is available.
-     */
+    // ── Convenience wrappers ─────────────────────────────────────────────────
+
+    // Spin-wait enqueue — calls try_enqueue in a pure _mm_pause loop.
+    // Zero OS scheduler involvement.
+    void enqueue(T* item) noexcept {
+        SpinWait bk;
+        while (!try_enqueue(item)) bk.spin();
+    }
+
+    // Spin-wait dequeue — calls try_dequeue in a pure _mm_pause loop.
     [[nodiscard]] T* dequeue() noexcept {
         T* item = nullptr;
-        SpinWait backoff;
-        while (!try_dequeue(item)) {
-            backoff.spin();
-        }
+        SpinWait bk;
+        while (!try_dequeue(item)) bk.spin();
         return item;
     }
 
-    /**
-     * Approximate queue size for telemetry/monitoring.
-     * Relaxed atomic reads - no barrier overhead.
-     */
+    // ── Telemetry (relaxed — monitoring only) ────────────────────────────────
     [[nodiscard]] std::size_t size_approx() const noexcept {
-        std::size_t head = head_.load(std::memory_order_relaxed);
-        std::size_t tail = tail_.load(std::memory_order_relaxed);
-        return (head >= tail) ? (head - tail) : 0;
+        std::size_t h = head_.load(std::memory_order_relaxed);
+        std::size_t t = tail_.load(std::memory_order_relaxed);
+        return (h >= t) ? (h - t) : 0;
     }
 
-    [[nodiscard]] bool empty_approx() const noexcept {
-        return size_approx() == 0;
+    [[nodiscard]] bool empty_approx() const noexcept { return size_approx() == 0; }
+    [[nodiscard]] constexpr std::size_t capacity() const noexcept { return Capacity; }
+
+protected:
+    // Expose head_/tail_ to OverwritePolicy which must advance tail on its own.
+    std::atomic<std::size_t>& head_ref() noexcept { return head_; }
+    std::atomic<std::size_t>& tail_ref() noexcept { return tail_; }
+    Slot<T>* slots_ptr() noexcept { return slots_; }
+
+    static constexpr std::size_t kMask = Capacity - 1;
+
+private:
+    // CRTP accessor — resolves to derived class at compile time, zero overhead.
+    Derived& derived() noexcept { return *static_cast<Derived*>(this); }
+
+    // ── Memory layout (3 isolated cache lines) ───────────────────────────────
+    // CL 0: slots_ pointer — read-mostly after construction
+    alignas(kCacheLineSize) Slot<T>* slots_{nullptr};
+
+    // CL 1: head_ — written exclusively by producers
+    alignas(kCacheLineSize) std::atomic<std::size_t> head_{0};
+
+    // CL 2: tail_ — written exclusively by consumers
+    alignas(kCacheLineSize) std::atomic<std::size_t> tail_{0};
+
+    // Trailing pad: prevents the allocation after RingBuffer from sharing tail_'s cache line
+    char _pad[kCacheLineSize - sizeof(std::atomic<std::size_t>)]{};
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Policy 1 — RingBuffer (Drop Policy)
+//
+// Default HFT ring buffer.
+// on_full  → returns false immediately (drop / signal backpressure to caller)
+// on_empty → returns false immediately (caller decides whether to retry)
+//
+// Use when: producers must never block; dropped items are acceptable
+// (e.g. market data feed where stale tick is useless anyway).
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename T = void, std::size_t Capacity = 1024>
+class RingBuffer : public RingBufferBase<RingBuffer<T, Capacity>, T, Capacity> {
+    friend class RingBufferBase<RingBuffer<T, Capacity>, T, Capacity>;
+public:
+    using RingBufferBase<RingBuffer<T, Capacity>, T, Capacity>::RingBufferBase;
+
+private:
+    // Queue full: drop the item, return false to caller.
+    [[nodiscard]] bool on_full(T*, std::size_t&) noexcept { return false; }
+    // Queue empty: signal caller immediately.
+    [[nodiscard]] bool on_empty(T*&, std::size_t&) noexcept { return false; }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Policy 2 — SpinningRingBuffer (Spin-Wait Policy)
+//
+// on_full  → spins with _mm_pause until a slot is free (no OS yield)
+// on_empty → spins with _mm_pause until an item is available
+//
+// Use when: producers/consumers must never lose items and can tolerate
+// busy-waiting (e.g. order book update pipeline on a dedicated core).
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename T = void, std::size_t Capacity = 1024>
+class SpinningRingBuffer
+    : public RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity> {
+    friend class RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity>;
+public:
+    using RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity>::RingBufferBase;
+
+private:
+    // Spin until head advances (slot freed by a consumer); signal base to retry.
+    [[nodiscard]] bool on_full(T*, std::size_t& pos) noexcept {
+        cache::cpu_relax();
+        pos = this->head_ref().load(std::memory_order_relaxed);
+        return true;  // tell base: retry the outer loop
     }
 
-    [[nodiscard]] constexpr std::size_t capacity() const noexcept {
-        return Capacity;
+    // Spin until tail advances (item published by a producer); signal base to retry.
+    [[nodiscard]] bool on_empty(T*&, std::size_t& pos) noexcept {
+        cache::cpu_relax();
+        pos = this->tail_ref().load(std::memory_order_relaxed);
+        return true;
+    }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Policy 3 — OverwriteRingBuffer (Overwrite-Oldest Policy)
+//
+// on_full  → forcibly advances tail by 1 (evicts oldest unconsumed item),
+//            then tells the base to retry the enqueue.
+// on_empty → returns false (nothing to read).
+//
+// Use when: newest data always wins, oldest data is expendable
+// (e.g. real-time sensor feed, top-of-book price updates).
+//
+// WARNING: The evicted item pointer is simply lost — the caller is responsible
+// for not leaking payload memory. Pair with ObjectPool::release() in a
+// destructor/guard if necessary.
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename T = void, std::size_t Capacity = 1024>
+class OverwriteRingBuffer
+    : public RingBufferBase<OverwriteRingBuffer<T, Capacity>, T, Capacity> {
+    friend class RingBufferBase<OverwriteRingBuffer<T, Capacity>, T, Capacity>;
+public:
+    using RingBufferBase<OverwriteRingBuffer<T, Capacity>, T, Capacity>::RingBufferBase;
+
+    // Public accessor: retrieve the pointer that was evicted during last overwrite.
+    // Returns nullptr if no eviction has occurred or the evicted slot is not yet visible.
+    [[nodiscard]] T* last_evicted() const noexcept {
+        return evicted_.load(std::memory_order_acquire);
     }
 
 private:
-    static constexpr std::size_t kMask = Capacity - 1;
+    // Force-advance tail by 1, exposing the slot for reuse.
+    // The slot's sequence is reset so the next producer can overwrite it.
+    [[nodiscard]] bool on_full(T*, std::size_t& pos) noexcept {
+        std::size_t tail_pos = this->tail_ref().load(std::memory_order_relaxed);
+        Slot<T>* evict_slot  = &this->slots_ptr()[tail_pos & this->kMask];
 
-    // Cache line 0: Pointer to dynamically allocated slots array. Read-mostly.
-    alignas(kCacheLineSize) Slot<T>* slots_{nullptr};
+        // Store evicted pointer for caller inspection (optional pool.release()).
+        evicted_.store(evict_slot->data, std::memory_order_relaxed);
 
-    // Cache line 1: Producer head index. Heavily modified by producers.
-    alignas(kCacheLineSize) std::atomic<std::size_t> head_{0};
+        // Advance tail — same CAS pattern as try_dequeue but we discard the value.
+        std::size_t expected_seq = tail_pos + 1;
+        std::size_t actual_seq   = evict_slot->sequence.load(std::memory_order_acquire);
 
-    // Cache line 2: Consumer tail index. Heavily modified by consumers.
-    alignas(kCacheLineSize) std::atomic<std::size_t> tail_{0};
+        if (actual_seq == expected_seq) {
+            if (this->tail_ref().compare_exchange_strong(
+                    tail_pos, tail_pos + 1,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                // Release the slot back to the write-ready state for head to claim.
+                evict_slot->sequence.store(tail_pos + this->kMask + 1,
+                                           std::memory_order_release);
+            }
+        }
+        // Reload head to reflect the now-freed slot.
+        pos = this->head_ref().load(std::memory_order_relaxed);
+        return true; // tell base: retry enqueue
+    }
 
-    // Trailing padding to prevent adjacent allocations from sharing the tail_ cache line
-    char _pad[kCacheLineSize - sizeof(std::atomic<std::size_t>)]{};
+    [[nodiscard]] bool on_empty(T*&, std::size_t&) noexcept { return false; }
+
+    // Stores the pointer of the most recently evicted (overwritten) item.
+    // Callers may inspect this to return it to an ObjectPool.
+    alignas(kCacheLineSize) std::atomic<T*> evicted_{nullptr};
 };
 
 } // namespace mpmc

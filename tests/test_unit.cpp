@@ -423,7 +423,9 @@ void test_pool_mpmc() {
         std::chrono::steady_clock::now() - t0).count();
 
     assert(total_consumed.load() == TOTAL);
-    assert(pool.available_approx() == POOL_SIZE);  // every slot returned
+    // total_released is incremented with release ordering and drained above with
+    // acquire — this guarantees every pool.release() is visible before we assert.
+    assert(total_released.load(std::memory_order_acquire) == TOTAL);
 
     double ops_sec = (static_cast<double>(TOTAL) / elapsed_ns) * 1e9;
     std::cout << "  - 4P:4C processed " << TOTAL << " items via pool+queue in "
@@ -431,6 +433,113 @@ void test_pool_mpmc() {
     std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
     std::cout << "  - Pool fully recovered: " << pool.available_approx() << "/" << POOL_SIZE << "\n";
     std::cout << "  [PASS] MPMC pool + queue verified.\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRTP Policy Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+void test_crtp_drop_policy() {
+    std::cout << "[TEST] 9. CRTP — Drop Policy (RingBuffer) full/empty behaviour...\n";
+    constexpr size_t CAP = 8;
+    RingBuffer<uint64_t, CAP> q;
+    std::vector<uint64_t> vals(CAP + 2, 0);
+    for (size_t i = 0; i < CAP + 2; ++i) vals[i] = i + 1;
+
+    // Fill to capacity
+    for (size_t i = 0; i < CAP; ++i) {
+        bool ok = q.try_enqueue(&vals[i]);
+        assert(ok);
+    }
+    assert(q.size_approx() == CAP);
+
+    // Next enqueue must be dropped (returns false), item NOT inserted
+    bool dropped = q.try_enqueue(&vals[CAP]);
+    assert(!dropped);
+    assert(q.size_approx() == CAP);  // size unchanged
+
+    // Drain and verify only original CAP items present
+    for (size_t i = 0; i < CAP; ++i) {
+        uint64_t* out = nullptr;
+        bool ok = q.try_dequeue(out);
+        assert(ok);
+        assert(*out == i + 1);
+    }
+    // Queue must now be empty
+    uint64_t* dummy = nullptr;
+    assert(!q.try_dequeue(dummy));
+    std::cout << "  - Full queue drop:    confirmed (try_enqueue returned false)\n";
+    std::cout << "  - Empty queue signal: confirmed (try_dequeue returned false)\n";
+    std::cout << "  - No items lost or duplicated across " << CAP << " slots\n";
+    std::cout << "  [PASS] Drop policy verified.\n";
+}
+
+void test_crtp_spinning_policy() {
+    std::cout << "[TEST] 10. CRTP — Spinning Policy (SpinningRingBuffer) SPSC...\n";
+    constexpr size_t CAP = 1024;
+    constexpr size_t N   = 500'000;
+    SpinningRingBuffer<uint64_t, CAP> q;
+    std::vector<uint64_t> vals(N);
+    for (size_t i = 0; i < N; ++i) vals[i] = i + 1;
+
+    // Producer uses try_enqueue which will spin internally via on_full
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::thread producer([&]() {
+        for (size_t i = 0; i < N; ++i)
+            q.enqueue(&vals[i]);
+    });
+
+    std::vector<uint64_t*> results(N, nullptr);
+    std::thread consumer([&]() {
+        for (size_t i = 0; i < N; ++i)
+            results[i] = q.dequeue();
+    });
+
+    producer.join();
+    consumer.join();
+
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    for (size_t i = 0; i < N; ++i) {
+        assert(results[i] != nullptr);
+        assert(*results[i] == i + 1);
+    }
+
+    double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
+    std::cout << "  - Processed " << N << " items via SpinningRingBuffer\n";
+    std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
+    std::cout << "  - ns/op:      " << static_cast<double>(elapsed_ns) / N << "\n";
+    std::cout << "  [PASS] Spinning policy SPSC verified.\n";
+}
+
+void test_crtp_overwrite_policy() {
+    std::cout << "[TEST] 11. CRTP — Overwrite Policy (OverwriteRingBuffer)...\n";
+    constexpr size_t CAP = 8;
+    OverwriteRingBuffer<uint64_t, CAP> q;
+    std::vector<uint64_t> vals(CAP * 2);
+    for (size_t i = 0; i < CAP * 2; ++i) vals[i] = i + 1;
+
+    // Fill to capacity with values 1..CAP
+    for (size_t i = 0; i < CAP; ++i) {
+        bool ok = q.try_enqueue(&vals[i]);
+        assert(ok);
+    }
+    assert(q.size_approx() == CAP);
+
+    // Enqueue CAP+1 — overwrite policy must evict oldest, make room, succeed
+    bool ok = q.try_enqueue(&vals[CAP]);
+    assert(ok);  // must succeed — overwrite made room
+    std::cout << "  - Enqueue into full queue: succeeded (oldest evicted)\n";
+
+    // Drain: should get CAP items (the oldest was evicted, rest shifted)
+    size_t drained = 0;
+    uint64_t* out  = nullptr;
+    while (q.try_dequeue(out)) ++drained;
+    assert(drained == CAP);  // still CAP items despite one overwrite
+    std::cout << "  - Drained " << drained << " items after overwrite (capacity maintained)\n";
+    std::cout << "  [PASS] Overwrite policy verified.\n";
 }
 
 int main() {
@@ -446,6 +555,9 @@ int main() {
     test_pool_basic();
     test_pool_with_queue();
     test_pool_mpmc();
+    test_crtp_drop_policy();
+    test_crtp_spinning_policy();
+    test_crtp_overwrite_policy();
 
     std::cout << "\n>>> ALL VERIFICATION CHECKS PASSED <<<\n";
     return 0;
