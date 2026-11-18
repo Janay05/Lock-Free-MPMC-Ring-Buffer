@@ -123,7 +123,8 @@ public:
                     slot->sequence.store(pos + 1, std::memory_order_release);
                     return true;
                 }
-                // CAS failed — pos now holds the refreshed head; retry.
+                // CAS failed — pos now holds the refreshed head; pause to let winning core retire store
+                cache::cpu_relax();
             } else if (diff < 0) {
                 // Queue is full. Delegate to policy.
                 if (derived().on_full(item, pos)) {
@@ -162,6 +163,7 @@ public:
                     return true;
                 }
                 ++stats.enqueue_cas_fail;
+                cache::cpu_relax();
             } else if (diff < 0) {
                 if (derived().on_full(item, pos)) {
                     pos = head_.load(std::memory_order_relaxed);
@@ -199,6 +201,7 @@ public:
                     slot->sequence.store(pos + kMask + 1, std::memory_order_release);
                     return true;
                 }
+                cache::cpu_relax();
             } else if (diff < 0) {
                 if (derived().on_empty(out_item, pos)) {
                     pos = tail_.load(std::memory_order_relaxed);
@@ -233,6 +236,7 @@ public:
                     return true;
                 }
                 ++stats.dequeue_cas_fail;
+                cache::cpu_relax();
             } else if (diff < 0) {
                 if (derived().on_empty(out_item, pos)) {
                     pos = tail_.load(std::memory_order_relaxed);
@@ -278,6 +282,44 @@ public:
                 }
                 return to_claim;
             }
+            cache::cpu_relax();
+        }
+    }
+
+    [[nodiscard]] std::size_t try_enqueue_bulk(T* const* items,
+                                                std::size_t max_count,
+                                                QueueStats& stats) noexcept {
+        if (__builtin_expect(max_count == 0, 0)) return 0;
+
+        std::size_t pos = head_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            std::size_t current_tail = tail_.load(std::memory_order_relaxed);
+            std::size_t occupied     = pos - current_tail;
+            if (occupied >= Capacity) {
+                ++stats.enqueue_full;
+                return 0;
+            }
+
+            std::size_t available = Capacity - occupied;
+            std::size_t to_claim  = (max_count < available) ? max_count : available;
+            if (to_claim == 0) return 0;
+
+            if (head_.compare_exchange_weak(pos, pos + to_claim,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                for (std::size_t i = 0; i < to_claim; ++i) {
+                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SpinWait bk;
+                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
+                        bk.spin();
+                    slot->data = items[i];
+                    slot->sequence.store(pos + i + 1, std::memory_order_release);
+                }
+                stats.enqueue_success += to_claim;
+                return to_claim;
+            }
+            ++stats.enqueue_cas_fail;
+            cache::cpu_relax();
         }
     }
 
@@ -308,6 +350,43 @@ public:
                 }
                 return to_claim;
             }
+            cache::cpu_relax();
+        }
+    }
+
+    [[nodiscard]] std::size_t try_dequeue_bulk(T** out_items,
+                                                std::size_t max_count,
+                                                QueueStats& stats) noexcept {
+        if (__builtin_expect(max_count == 0, 0)) return 0;
+
+        std::size_t pos = tail_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            std::size_t current_head = head_.load(std::memory_order_relaxed);
+            if (pos >= current_head) {
+                ++stats.dequeue_empty;
+                return 0;
+            }
+
+            std::size_t available = current_head - pos;
+            std::size_t to_claim  = (max_count < available) ? max_count : available;
+            if (to_claim == 0) return 0;
+
+            if (tail_.compare_exchange_weak(pos, pos + to_claim,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                for (std::size_t i = 0; i < to_claim; ++i) {
+                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SpinWait bk;
+                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
+                        bk.spin();
+                    out_items[i] = slot->data;
+                    slot->sequence.store(pos + i + kMask + 1, std::memory_order_release);
+                }
+                stats.dequeue_success += to_claim;
+                return to_claim;
+            }
+            ++stats.dequeue_cas_fail;
+            cache::cpu_relax();
         }
     }
 

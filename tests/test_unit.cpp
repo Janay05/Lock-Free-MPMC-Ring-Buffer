@@ -684,6 +684,83 @@ void test_cas_telemetry() {
     std::cout << "  [PASS] CAS Telemetry verified.\n";
 }
 
+void test_bulk_cas_telemetry() {
+    std::cout << "[TEST] 14. Bulk Operations CAS Contention Telemetry (Batch=32)...\n";
+
+    constexpr size_t N_PER_PRODUCER = 250'000;
+    constexpr size_t PRODUCERS      = 4;
+    constexpr size_t CONSUMERS      = 4;
+    constexpr size_t TOTAL          = N_PER_PRODUCER * PRODUCERS;
+    constexpr size_t BATCH_SIZE     = 32;
+
+    RingBuffer<uint64_t, 2048> rb;
+
+    std::vector<QueueStats> p_stats(PRODUCERS);
+    std::vector<QueueStats> c_stats(CONSUMERS);
+
+    std::vector<uint64_t> payload(TOTAL);
+    std::vector<uint64_t*> payload_ptrs(TOTAL);
+    for (size_t i = 0; i < TOTAL; ++i) {
+        payload[i] = i + 1;
+        payload_ptrs[i] = &payload[i];
+    }
+
+    std::atomic<bool> start_gate{false};
+    std::atomic<size_t> total_consumed{0};
+
+    std::vector<std::thread> producers_t, consumers_t;
+
+    for (size_t c = 0; c < CONSUMERS; ++c) {
+        consumers_t.emplace_back([&, c]() {
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            std::vector<uint64_t*> dest(BATCH_SIZE, nullptr);
+            while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
+                size_t n = rb.try_dequeue_bulk(dest.data(), BATCH_SIZE, c_stats[c]);
+                if (n > 0) {
+                    total_consumed.fetch_add(n, std::memory_order_relaxed);
+                } else {
+                    cache::cpu_relax();
+                }
+            }
+        });
+    }
+
+    for (size_t p = 0; p < PRODUCERS; ++p) {
+        producers_t.emplace_back([&, p]() {
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            size_t base = p * N_PER_PRODUCER;
+            size_t enqueued = 0;
+            while (enqueued < N_PER_PRODUCER) {
+                size_t chunk = std::min(BATCH_SIZE, N_PER_PRODUCER - enqueued);
+                size_t n = rb.try_enqueue_bulk(&payload_ptrs[base + enqueued], chunk, p_stats[p]);
+                if (n > 0) {
+                    enqueued += n;
+                } else {
+                    cache::cpu_relax();
+                }
+            }
+        });
+    }
+
+    start_gate.store(true, std::memory_order_release);
+
+    for (auto& t : producers_t) t.join();
+    for (auto& t : consumers_t) t.join();
+
+    QueueStats total_p = aggregate_stats(p_stats);
+    QueueStats total_c = aggregate_stats(c_stats);
+
+    assert(total_p.enqueue_success == TOTAL);
+    assert(total_c.dequeue_success == TOTAL);
+
+    std::cout << "  --- Aggregated Bulk Producer Telemetry ---\n";
+    total_p.print_summary(std::cout, "    ");
+    std::cout << "  --- Aggregated Bulk Consumer Telemetry ---\n";
+    total_c.print_summary(std::cout, "    ");
+
+    std::cout << "  [PASS] Bulk CAS Telemetry verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "     HFT Lock-Free MPMC Ring Buffer Verification Suite  \n";
@@ -702,6 +779,7 @@ int main() {
     test_crtp_overwrite_policy();
     test_histogram();
     test_cas_telemetry();
+    test_bulk_cas_telemetry();
 
     std::cout << "\n>>> ALL VERIFICATION CHECKS PASSED <<<\n";
     return 0;
