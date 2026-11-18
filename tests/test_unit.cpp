@@ -1,4 +1,5 @@
 #include "mpmc/ring_buffer.hpp"
+#include "mpmc/pool.hpp"
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -253,6 +254,185 @@ void test_bulk_operations() {
     std::cout << "  [PASS] Bulk operations verified.\n";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pool Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Order {
+    uint64_t id{0};
+    double   price{0.0};
+    uint32_t qty{0};
+};
+
+void test_pool_basic() {
+    std::cout << "[TEST] 6. Object Pool — Basic Acquire/Release...\n";
+    constexpr size_t POOL_SIZE = 1024;
+    ObjectPool<Order, POOL_SIZE> pool;
+
+    // All slots should be free at construction
+    assert(pool.available_approx() == POOL_SIZE);
+    assert(pool.in_use_approx()    == 0);
+    assert(pool.capacity()         == POOL_SIZE);
+    std::cout << "  - Capacity: " << pool.capacity() << " slots\n";
+    std::cout << "  - Initial available: " << pool.available_approx() << "\n";
+
+    // Acquire all slots
+    std::vector<Order*> ptrs;
+    ptrs.reserve(POOL_SIZE);
+    for (size_t i = 0; i < POOL_SIZE; ++i) {
+        Order* o = pool.acquire();
+        assert(o != nullptr);
+        o->id    = i + 1;
+        o->price = static_cast<double>(i) * 1.5;
+        o->qty   = static_cast<uint32_t>(i % 1000);
+        ptrs.push_back(o);
+    }
+    // Pool must now be exhausted
+    assert(pool.available_approx() == 0);
+    assert(pool.acquire() == nullptr);
+    std::cout << "  - After full acquire: available=" << pool.available_approx() << " (exhausted)\n";
+
+    // Release all back — verify data written earlier is intact
+    for (size_t i = 0; i < POOL_SIZE; ++i) {
+        assert(ptrs[i]->id    == i + 1);
+        assert(ptrs[i]->qty   == static_cast<uint32_t>(i % 1000));
+        pool.release(ptrs[i]);
+    }
+    assert(pool.available_approx() == POOL_SIZE);
+    std::cout << "  - After full release: available=" << pool.available_approx() << "\n";
+    std::cout << "  [PASS] Pool acquire/release verified.\n";
+}
+
+void test_pool_with_queue() {
+    std::cout << "[TEST] 7. Pool + Queue Integration (zero-malloc end-to-end)...\n";
+    constexpr size_t POOL_SIZE = 2048;
+    constexpr size_t N         = 1'000'000;
+
+    ObjectPool<Order, POOL_SIZE> pool;
+    RingBuffer<Order, POOL_SIZE> queue;
+
+    auto start = std::chrono::steady_clock::now();
+
+    std::thread producer([&]() {
+        uint64_t seq = 0;
+        while (seq < N) {
+            Order* o = pool.acquire();
+            if (!o) {
+                cache::cpu_relax();
+                continue;
+            }
+            o->id    = ++seq;
+            o->price = static_cast<double>(seq) * 0.01;
+            o->qty   = static_cast<uint32_t>(seq % 500);
+            queue.enqueue(o);
+        }
+    });
+
+    uint64_t consumed = 0;
+    uint64_t checksum = 0;
+    std::thread consumer([&]() {
+        while (consumed < N) {
+            Order* o = queue.dequeue();
+            checksum += o->id;        // accumulate to prove correct data
+            pool.release(o);          // return slot to pool — zero free()
+            ++consumed;
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    auto end        = std::chrono::steady_clock::now();
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+
+    // Sum of 1..N = N*(N+1)/2
+    uint64_t expected_checksum = static_cast<uint64_t>(N) * (N + 1) / 2;
+    assert(checksum  == expected_checksum);
+    assert(pool.available_approx() == POOL_SIZE);  // all slots returned to pool
+    assert(queue.empty_approx());
+
+    double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
+    std::cout << "  - Processed " << N << " messages (pool acquire→queue→dequeue→pool release)\n";
+    std::cout << "  - Elapsed:    " << elapsed_ns / 1'000'000.0 << " ms\n";
+    std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
+    std::cout << "  - ns/op:      " << static_cast<double>(elapsed_ns) / N << "\n";
+    std::cout << "  - Checksum:   " << checksum << " (expected " << expected_checksum << ")\n";
+    std::cout << "  - Pool slots recovered: " << pool.available_approx() << "/" << POOL_SIZE << "\n";
+    std::cout << "  [PASS] Pool + Queue zero-malloc integration verified.\n";
+}
+
+void test_pool_mpmc() {
+    std::cout << "[TEST] 8. Pool — MPMC Concurrent Acquire/Release (4P:4C)...\n";
+    constexpr size_t POOL_SIZE       = 4096;
+    constexpr size_t N_PER_PRODUCER  = 250'000;
+    constexpr size_t PRODUCERS       = 4;
+    constexpr size_t CONSUMERS       = 4;
+    constexpr size_t TOTAL           = N_PER_PRODUCER * PRODUCERS;
+
+    ObjectPool<Order, POOL_SIZE> pool;
+    RingBuffer<Order, POOL_SIZE> queue;
+
+    std::atomic<bool>   start_gate{false};
+    std::atomic<size_t> total_consumed{0};
+    std::atomic<size_t> total_released{0};  // incremented strictly after pool.release()
+
+    std::vector<std::thread> producers_t, consumers_t;
+
+    for (size_t c = 0; c < CONSUMERS; ++c) {
+        consumers_t.emplace_back([&]() {
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
+                Order* o = nullptr;
+                if (queue.try_dequeue(o)) {
+                    pool.release(o);
+                    total_released.fetch_add(1, std::memory_order_release);  // after release
+                    total_consumed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    cache::cpu_relax();
+                }
+            }
+        });
+    }
+
+    for (size_t p = 0; p < PRODUCERS; ++p) {
+        producers_t.emplace_back([&, p]() {
+            (void)p;
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
+                Order* o = nullptr;
+                while (!(o = pool.acquire())) cache::cpu_relax();
+                o->id  = i;
+                queue.enqueue(o);
+            }
+        });
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    start_gate.store(true, std::memory_order_release);
+
+    for (auto& t : producers_t) t.join();
+    for (auto& t : consumers_t) t.join();
+
+    // Spin until all releases are visible — total_released uses release ordering
+    // so this acquire load synchronizes with every pool.release() call
+    while (total_released.load(std::memory_order_acquire) < TOTAL) {
+        cache::cpu_relax();
+    }
+
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    assert(total_consumed.load() == TOTAL);
+    assert(pool.available_approx() == POOL_SIZE);  // every slot returned
+
+    double ops_sec = (static_cast<double>(TOTAL) / elapsed_ns) * 1e9;
+    std::cout << "  - 4P:4C processed " << TOTAL << " items via pool+queue in "
+              << elapsed_ns / 1'000'000.0 << " ms\n";
+    std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
+    std::cout << "  - Pool fully recovered: " << pool.available_approx() << "/" << POOL_SIZE << "\n";
+    std::cout << "  [PASS] MPMC pool + queue verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "     HFT Lock-Free MPMC Ring Buffer Verification Suite  \n";
@@ -263,6 +443,9 @@ int main() {
     test_mpmc();
     test_rdtsc_latency();
     test_bulk_operations();
+    test_pool_basic();
+    test_pool_with_queue();
+    test_pool_mpmc();
 
     std::cout << "\n>>> ALL VERIFICATION CHECKS PASSED <<<\n";
     return 0;
