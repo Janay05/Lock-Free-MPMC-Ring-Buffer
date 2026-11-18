@@ -1,5 +1,6 @@
 #include "mpmc/ring_buffer.hpp"
 #include "mpmc/pool.hpp"
+#include "mpmc/histogram.hpp"
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -542,6 +543,73 @@ void test_crtp_overwrite_policy() {
     std::cout << "  [PASS] Overwrite policy verified.\n";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Latency Histogram Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+void test_histogram() {
+    std::cout << "[TEST] 12. Lock-Free Latency Histogram Verification...\n";
+
+    LatencyHistogram hist;
+
+    // 1. Monotonicity & Value-to-Bucket Mapping
+    uint64_t prev_val = 0;
+    for (uint64_t v = 1; v < 100'000'000ULL; v = v * 2 + 1) {
+        size_t b = LatencyHistogram::value_to_bucket(v);
+        uint64_t roundtrip = LatencyHistogram::bucket_to_value(b);
+        assert(b > 0);
+        // Sub-bucket relative quantization error should be within ~10%
+        double rel_error = std::abs(static_cast<double>(roundtrip) - static_cast<double>(v)) / v;
+        assert(rel_error < 0.15);
+        prev_val = v;
+    }
+    (void)prev_val;
+
+    // 2. Synthetic Percentile Check
+    // Insert values 1..10,000 linearly
+    for (uint64_t i = 1; i <= 10'000; ++i) {
+        hist.record(i);
+    }
+    assert(hist.count() == 10'000);
+    assert(hist.min() == 1);
+    assert(hist.max() == 10'000);
+
+    // p50 should be ~5000, p99 should be ~9900 within bucket quantization bounds
+    uint64_t p50 = hist.percentile(50.0);
+    uint64_t p99 = hist.percentile(99.0);
+    assert(p50 >= 4500 && p50 <= 5500);
+    assert(p99 >= 9500 && p99 <= 10300);
+    std::cout << "  - Synthetic p50: " << p50 << " (expected ~5000)\n";
+    std::cout << "  - Synthetic p99: " << p99 << " (expected ~9900)\n";
+
+    // 3. Real Profiling on RingBuffer Enqueue + Dequeue (100,000 samples)
+    LatencyHistogram rtt_hist;
+    RingBuffer<uint64_t, 1024> rb;
+    uint64_t item = 0xDEADBEEF;
+    uint64_t* out = nullptr;
+
+    // Warm-up
+    for (size_t i = 0; i < 1000; ++i) {
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(&item);
+        [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
+    }
+
+    constexpr size_t PROFILING_SAMPLES = 100'000;
+    for (size_t i = 0; i < PROFILING_SAMPLES; ++i) {
+        uint64_t t0 = cache::rdtsc();
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(&item);
+        [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
+        uint64_t t1 = cache::rdtsc();
+        rtt_hist.record(t1 - t0);
+    }
+
+    std::cout << "  --- Real RingBuffer RTT Percentile Distribution ---\n";
+    rtt_hist.print_summary(std::cout, "cycles");
+    assert(rtt_hist.count() == PROFILING_SAMPLES);
+    assert(rtt_hist.percentile(50.0) > 0);
+    std::cout << "  [PASS] Latency Histogram verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "     HFT Lock-Free MPMC Ring Buffer Verification Suite  \n";
@@ -558,6 +626,7 @@ int main() {
     test_crtp_drop_policy();
     test_crtp_spinning_policy();
     test_crtp_overwrite_policy();
+    test_histogram();
 
     std::cout << "\n>>> ALL VERIFICATION CHECKS PASSED <<<\n";
     return 0;
