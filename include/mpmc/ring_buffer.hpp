@@ -3,6 +3,7 @@
 #include "cache.hpp"
 #include "slot.hpp"
 #include "backoff.hpp"
+#include "stats.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -139,6 +140,41 @@ public:
         }
     }
 
+    /**
+     * Instrumented non-blocking single-item enqueue.
+     * Records CAS collisions and queue fullness into caller's thread-local QueueStats.
+     */
+    [[nodiscard]] bool try_enqueue(T* item, QueueStats& stats) noexcept {
+        std::size_t pos = head_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            Slot<T>* slot = &slots_[pos & kMask];
+            std::size_t seq = slot->sequence.load(std::memory_order_acquire);
+            intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+
+            if (__builtin_expect(diff == 0, 1)) {
+                if (head_.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    cache::prefetch_write(&slots_[(pos + 1) & kMask]);
+                    slot->data = item;
+                    slot->sequence.store(pos + 1, std::memory_order_release);
+                    ++stats.enqueue_success;
+                    return true;
+                }
+                ++stats.enqueue_cas_fail;
+            } else if (diff < 0) {
+                if (derived().on_full(item, pos)) {
+                    pos = head_.load(std::memory_order_relaxed);
+                    continue;
+                }
+                ++stats.enqueue_full;
+                return false;
+            } else {
+                pos = head_.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
     // ── Core dequeue ─────────────────────────────────────────────────────────
     /**
      * Non-blocking single-item dequeue.
@@ -168,6 +204,41 @@ public:
                     pos = tail_.load(std::memory_order_relaxed);
                     continue;
                 }
+                return false;
+            } else {
+                pos = tail_.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    /**
+     * Instrumented non-blocking single-item dequeue.
+     * Records CAS collisions and queue emptiness into caller's thread-local QueueStats.
+     */
+    [[nodiscard]] bool try_dequeue(T*& out_item, QueueStats& stats) noexcept {
+        std::size_t pos = tail_.load(std::memory_order_relaxed);
+
+        for (;;) {
+            Slot<T>* slot = &slots_[pos & kMask];
+            std::size_t seq = slot->sequence.load(std::memory_order_acquire);
+            intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+
+            if (__builtin_expect(diff == 0, 1)) {
+                if (tail_.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    cache::prefetch_read(&slots_[(pos + 1) & kMask]);
+                    out_item = slot->data;
+                    slot->sequence.store(pos + kMask + 1, std::memory_order_release);
+                    ++stats.dequeue_success;
+                    return true;
+                }
+                ++stats.dequeue_cas_fail;
+            } else if (diff < 0) {
+                if (derived().on_empty(out_item, pos)) {
+                    pos = tail_.load(std::memory_order_relaxed);
+                    continue;
+                }
+                ++stats.dequeue_empty;
                 return false;
             } else {
                 pos = tail_.load(std::memory_order_relaxed);

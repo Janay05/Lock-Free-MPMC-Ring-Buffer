@@ -610,6 +610,80 @@ void test_histogram() {
     std::cout << "  [PASS] Latency Histogram verified.\n";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CAS Contention Telemetry Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+void test_cas_telemetry() {
+    std::cout << "[TEST] 13. Thread-Isolated CAS Contention Telemetry...\n";
+
+    static_assert(sizeof(QueueStats) == 64, "QueueStats must be exactly 64 bytes");
+    static_assert(alignof(QueueStats) == 64, "QueueStats must be cache-line aligned");
+
+    constexpr size_t N_PER_PRODUCER = 250'000;
+    constexpr size_t PRODUCERS      = 4;
+    constexpr size_t CONSUMERS      = 4;
+    constexpr size_t TOTAL          = N_PER_PRODUCER * PRODUCERS;
+
+    RingBuffer<uint64_t, 1024> rb;
+
+    // Cache-line aligned vector of stats per thread: zero false sharing between counters
+    std::vector<QueueStats> p_stats(PRODUCERS);
+    std::vector<QueueStats> c_stats(CONSUMERS);
+
+    std::vector<uint64_t> payload(TOTAL);
+    for (size_t i = 0; i < TOTAL; ++i) payload[i] = i + 1;
+
+    std::atomic<bool> start_gate{false};
+    std::atomic<size_t> total_consumed{0};
+
+    std::vector<std::thread> producers_t, consumers_t;
+
+    for (size_t c = 0; c < CONSUMERS; ++c) {
+        consumers_t.emplace_back([&, c]() {
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
+                uint64_t* out = nullptr;
+                if (rb.try_dequeue(out, c_stats[c])) {
+                    total_consumed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    cache::cpu_relax();
+                }
+            }
+        });
+    }
+
+    for (size_t p = 0; p < PRODUCERS; ++p) {
+        producers_t.emplace_back([&, p]() {
+            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            size_t base = p * N_PER_PRODUCER;
+            for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
+                while (!rb.try_enqueue(&payload[base + i], p_stats[p])) {
+                    cache::cpu_relax();
+                }
+            }
+        });
+    }
+
+    start_gate.store(true, std::memory_order_release);
+
+    for (auto& t : producers_t) t.join();
+    for (auto& t : consumers_t) t.join();
+
+    QueueStats total_p = aggregate_stats(p_stats);
+    QueueStats total_c = aggregate_stats(c_stats);
+
+    assert(total_p.enqueue_success == TOTAL);
+    assert(total_c.dequeue_success == TOTAL);
+
+    std::cout << "  --- Aggregated Producer Telemetry ---\n";
+    total_p.print_summary(std::cout, "    ");
+    std::cout << "  --- Aggregated Consumer Telemetry ---\n";
+    total_c.print_summary(std::cout, "    ");
+
+    std::cout << "  [PASS] CAS Telemetry verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "     HFT Lock-Free MPMC Ring Buffer Verification Suite  \n";
@@ -627,6 +701,7 @@ int main() {
     test_crtp_spinning_policy();
     test_crtp_overwrite_policy();
     test_histogram();
+    test_cas_telemetry();
 
     std::cout << "\n>>> ALL VERIFICATION CHECKS PASSED <<<\n";
     return 0;
