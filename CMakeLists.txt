@@ -30,3 +30,10 @@ target_include_directories(mpmc_queue INTERFACE
 
 enable_testing()
 add_subdirectory(tests)
+
+# Core-pinned benchmark target
+add_executable(bench_pinned benchmarks/bench_pinned.cpp)
+target_link_libraries(bench_pinned PRIVATE mpmc_queue)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_libraries(bench_pinned PRIVATE -pthread)
+endif()
