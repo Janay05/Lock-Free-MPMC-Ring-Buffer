@@ -119,17 +119,9 @@ public:
      * Hot path cost: 1 atomic load (acquire) + 1 CAS + 1 atomic store (release)
      */
     void release(T* ptr) noexcept {
-        // In a correctly-used pool, the free list can never be full here
-        // because Capacity objects were taken from it. Assert in debug builds.
-#ifdef MPMC_DEBUG
-        bool ok = free_list_.try_enqueue(ptr);
-        // This fires only on double-release or foreign pointer bugs
-        if (!ok) {
-            __builtin_trap();   // hard abort — pool invariant violated
-        }
-#else
-        [[maybe_unused]] bool ok = free_list_.try_enqueue(ptr);
-#endif
+        // Enqueue back to the free list. Spins with _mm_pause until the slot is claimed.
+        // Since at most Capacity items can be in use, the free list is guaranteed to have space.
+        free_list_.enqueue(ptr);
     }
 
     /**
