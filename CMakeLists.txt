@@ -13,12 +13,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(
         -O3
-        -march=native
         -Wall
         -Wextra
         -Wpedantic
         -fno-rtti
     )
+    # Enable -march=native only for native builds; cross-compilers (e.g. AArch64) do not support 'native'
+    if (NOT CMAKE_CROSSCOMPILING)
+        add_compile_options(-march=native)
+    endif()
 endif()
 
 # Header-only library interface
