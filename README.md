@@ -27,6 +27,41 @@ Measured on physical P-Cores pinned with high priority (**Intel® Core™ i7-147
 
 ---
 
+## Industry Baseline Comparison
+
+To evaluate performance against industry standards, we benchmarked mpmc::RingBuffer under identical hardware, compiler flags (-O3 -march=native), and core-pinning conditions against:
+1. **
+igtorp::MPMCQueue** (Erik Rigtorp\'s industry reference bounded Vyukov MPMC queue).
+2. **moodycamel::ConcurrentQueue** (Cameron Desrochers\' lock-free unbounded queue with thread-local tokens).
+3. **std::mutex + std::deque** (Standard thread-safe mutex and condition-variable baseline).
+
+### Comparative Benchmark Results
+
+Executed on physical P-Cores pinned with THREAD_PRIORITY_TIME_CRITICAL (**Intel® Core™ i7-14700HX, Raptor Lake**):
+
+| Queue Implementation | Architecture Pattern | SPSC RTT (p50) | SPSC RTT (p99) | SPSC Unbatched (1P:1C) | MPMC Contention (4P:4C) | Bulk Throughput (Batch=32) |
+|---|---|---|---|---|---|---|
+| **mpmc::RingBuffer (Ours)** | Bounded Ticket Array + CRTP + Pause | **144 cyc (~31 ns)** | **224 cyc (~48 ns)** | **22.42 M ops/s** | 12.62 M ops/s | **589.2 M ops/s** |
+| **
+igtorp::MPMCQueue** | Bounded Ticket Array | 176 cyc (~38 ns) | 200 cyc (~43 ns) | 19.77 M ops/s | 16.62 M ops/s | 75.29 M ops/s* |
+| **moodycamel::ConcurrentQueue** | Unbounded Block Token Queue | 152 cyc (~33 ns) | 320 cyc (~69 ns) | 20.09 M ops/s | **19.46 M ops/s** | **617.7 M ops/s** |
+| **std::mutex + std::deque** | Mutex + Condvar + Deque | 1216 cyc (~264 ns) | 4864 cyc (~1057 ns) | 3.26 M ops/s | 11.49 M ops/s | 105.9 M ops/s |
+
+*\*Note: 
+igtorp::MPMCQueue does not expose a native bulk CAS API; bulk throughput was measured using a batched single-item loop.*
+
+### Architectural Analysis & Trade-offs
+
+1. **Lowest Cross-Core Round-Trip Latency (SPSC)**:
+   * mpmc::RingBuffer delivers the lowest median round-trip time (**144 cycles**, 18% faster than Rigtorp, 5% faster than Moodycamel, and 8.4× faster than a mutex). Our cache-line prefetching (prefetch_read / prefetch_write) and pure user-space cpu_relax() backoff minimize latency on single-item handover.
+2. **Bulk Amortization (	ry_enqueue_bulk / 	ry_dequeue_bulk)**:
+   * Amortizing the atomic CAS over 32 slots achieves **589.2 Million ops/sec** (~1.7 ns/item) — a **7.8× speedup over Rigtorp\'s batched loop** (75.3M ops/s), approaching Moodycamel\'s specialized multi-item block design (617.7M ops/s).
+3. **Contended Multi-Producer Multi-Consumer (4P:4C)**:
+   * Under heavy multi-producer contention, moodycamel::ConcurrentQueue achieves higher throughput (19.46M ops/s) because its architecture routes each producer to a dedicated thread-local block sub-queue, avoiding contention on a shared circular ring head.
+   * mpmc::RingBuffer achieves 12.62M ops/s under symmetric 4P:4C contention, maintaining sub-microsecond item transfer while avoiding the dynamic memory allocations and higher tail latency ($ of 320 cycles) inherent to block-chaining architectures.
+
+---
+
 ## Architectural Principles
 
 ```

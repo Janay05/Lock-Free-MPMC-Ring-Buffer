@@ -37,3 +37,34 @@ target_link_libraries(bench_pinned PRIVATE mpmc_queue)
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_libraries(bench_pinned PRIVATE -pthread)
 endif()
+
+# ── External Baselines for Comparative Benchmarking ──────────────────────────
+include(FetchContent)
+
+# 1. rigtorp::MPMCQueue (Industry reference bounded Vyukov MPMC)
+FetchContent_Declare(
+    rigtorp_mpmc
+    GIT_REPOSITORY https://github.com/rigtorp/MPMCQueue.git
+    GIT_TAG        master
+)
+
+# 2. moodycamel::ConcurrentQueue (Lock-free unbounded block-based queue)
+FetchContent_Declare(
+    moodycamel_cq
+    GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+    GIT_TAG        master
+)
+
+FetchContent_MakeAvailable(rigtorp_mpmc moodycamel_cq)
+
+# Comparative Benchmark Target
+add_executable(bench_comparison benchmarks/bench_comparison.cpp)
+target_link_libraries(bench_comparison PRIVATE mpmc_queue)
+target_include_directories(bench_comparison PRIVATE
+    ${rigtorp_mpmc_SOURCE_DIR}/include
+    ${moodycamel_cq_SOURCE_DIR}
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_libraries(bench_comparison PRIVATE -pthread)
+    target_compile_options(bench_comparison PRIVATE -Wno-stringop-overflow)
+endif()

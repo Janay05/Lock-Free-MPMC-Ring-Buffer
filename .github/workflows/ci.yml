@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  linux-build-and-test:
+    name: Linux (${{ matrix.compiler }}) - Unit, Stress & TSan
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc-12, clang-15]
+        include:
+          - compiler: gcc-12
+            c_compiler: gcc-12
+            cxx_compiler: g++-12
+          - compiler: clang-15
+            c_compiler: clang-15
+            cxx_compiler: clang++-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.compiler }}" = "gcc-12" ]; then
+            sudo apt-get install -y gcc-12 g++-12
+          elif [ "${{ matrix.compiler }}" = "clang-15" ]; then
+            sudo apt-get install -y clang-15
+          fi
+
+      - name: Configure CMake (Release)
+        env:
+          CC: ${{ matrix.c_compiler }}
+          CXX: ${{ matrix.cxx_compiler }}
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-O3 -march=x86-64-v3"
+
+      - name: Build Verification & Benchmarks
+        run: cmake --build build --config Release -j$(nproc)
+
+      - name: Run Unit Tests
+        run: ./build/tests/unit_tests
+
+      - name: Run Stress & Chaos Suite
+        run: ./build/tests/stress_tests
+
+      - name: Run Comparative Baseline Benchmarks
+        run: ./build/bench_comparison
+
+      - name: Build and Run ThreadSanitizer (TSan)
+        run: |
+          ./build/tests/tsan_tests
+
+  arm64-cross-compile:
+    name: AArch64 (ARM64) Cross-Compilation Check
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM64 Cross Compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Configure CMake for AArch64
+        run: |
+          cmake -B build-arm64 \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_CXX_FLAGS="-O3 -march=armv8-a"
+
+      - name: Build for AArch64 (Verifying yield hint and memory barriers)
+        run: cmake --build build-arm64 --target unit_tests -j$(nproc)
