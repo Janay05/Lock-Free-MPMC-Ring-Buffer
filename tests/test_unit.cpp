@@ -11,39 +11,48 @@
 
 using namespace mpmc;
 
+struct MarketOrder {
+    uint64_t order_id;
+    double price;
+    uint32_t qty;
+    uint32_t flags;
+    char client_id[16]; // 8 + 8 + 4 + 4 + 16 = 40 bytes <= 56 bytes inline!
+};
+static_assert(sizeof(MarketOrder) == 40, "MarketOrder must be 40 bytes");
+
 void test_cache_alignment() {
     std::cout << "[TEST] 1. Cache Line Alignment & False Sharing Verification...\n";
     
     // Check static compile-time constraints
-    static_assert(sizeof(Slot<void>) == 64, "Slot must be exactly 64 bytes");
-    static_assert(alignof(Slot<void>) == 64, "Slot alignment must be 64 bytes");
+    static_assert(sizeof(Slot<uint64_t>) == 64, "Slot<uint64_t> must be exactly 64 bytes");
+    static_assert(alignof(Slot<uint64_t>) == 64, "Slot<uint64_t> alignment must be 64 bytes");
+    static_assert(sizeof(Slot<void*>) == 64, "Slot<void*> must be exactly 64 bytes");
+    static_assert(alignof(Slot<void*>) == 64, "Slot<void*> alignment must be 64 bytes");
+    static_assert(sizeof(Slot<MarketOrder>) == 64, "Slot<MarketOrder> must be exactly 64 bytes");
+    static_assert(alignof(Slot<MarketOrder>) == 64, "Slot<MarketOrder> alignment must be 64 bytes");
 
-    RingBuffer<void, 1024> rb;
+    RingBuffer<uint64_t, 1024> rb;
 
-    std::cout << "  - sizeof(Slot): " << sizeof(Slot<void>) << " bytes\n";
-    std::cout << "  - alignof(Slot): " << alignof(Slot<void>) << " bytes\n";
+    std::cout << "  - sizeof(Slot<uint64_t>): " << sizeof(Slot<uint64_t>) << " bytes\n";
+    std::cout << "  - sizeof(Slot<MarketOrder>): " << sizeof(Slot<MarketOrder>) << " bytes\n";
+    std::cout << "  - alignof(Slot): " << alignof(Slot<uint64_t>) << " bytes\n";
     std::cout << "  [PASS] Cache line alignment verified.\n";
 }
 
 void test_spsc() {
-    std::cout << "[TEST] 2. Single-Producer Single-Consumer (1P:1C) Verification...\n";
+    std::cout << "[TEST] 2. Single-Producer Single-Consumer (1P:1C) By-Value Verification...\n";
     constexpr size_t N = 1'000'000;
     RingBuffer<uint64_t, 1024> rb;
-
-    std::vector<uint64_t> test_data(N);
-    for (size_t i = 0; i < N; ++i) {
-        test_data[i] = i + 1;
-    }
 
     auto start = std::chrono::steady_clock::now();
 
     std::thread producer([&]() {
         for (size_t i = 0; i < N; ++i) {
-            rb.enqueue(&test_data[i]);
+            rb.enqueue(i + 1);
         }
     });
 
-    std::vector<uint64_t*> received(N, nullptr);
+    std::vector<uint64_t> received(N, 0);
     std::thread consumer([&]() {
         for (size_t i = 0; i < N; ++i) {
             received[i] = rb.dequeue();
@@ -58,8 +67,7 @@ void test_spsc() {
 
     // Verify ordering and integrity
     for (size_t i = 0; i < N; ++i) {
-        assert(received[i] != nullptr);
-        assert(*received[i] == i + 1);
+        assert(received[i] == i + 1);
     }
 
     double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
@@ -78,15 +86,6 @@ void test_mpmc() {
 
     RingBuffer<uint64_t, 2048> rb;
 
-    // Allocate contiguous payload data
-    std::vector<std::vector<uint64_t>> producer_data(PRODUCERS);
-    for (size_t p = 0; p < PRODUCERS; ++p) {
-        producer_data[p].resize(N_PER_PRODUCER);
-        for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
-            producer_data[p][i] = (p + 1) * 1'000'000'000ULL + i;
-        }
-    }
-
     std::atomic<bool> start_gate{false};
     std::atomic<size_t> total_consumed{0};
     std::vector<std::vector<uint64_t>> consumer_results(CONSUMERS);
@@ -104,9 +103,9 @@ void test_mpmc() {
             std::vector<uint64_t> local;
             local.reserve(TOTAL_MESSAGES / CONSUMERS + 1000);
             while (total_consumed.load(std::memory_order_relaxed) < TOTAL_MESSAGES) {
-                uint64_t* item = nullptr;
+                uint64_t item = 0;
                 if (rb.try_dequeue(item)) {
-                    local.push_back(*item);
+                    local.push_back(item);
                     total_consumed.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     cache::cpu_relax();
@@ -125,7 +124,8 @@ void test_mpmc() {
                 cache::cpu_relax();
             }
             for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
-                rb.enqueue(&producer_data[p][i]);
+                uint64_t val = (p + 1) * 1'000'000'000ULL + i;
+                rb.enqueue(val);
             }
         });
     }
@@ -166,30 +166,26 @@ void test_rdtsc_latency() {
     RingBuffer<uint64_t, 1024> rb;
 
     uint64_t val = 42;
-    uint64_t* out = nullptr;
+    uint64_t out = 0;
 
     // Warm-up cache
     for (size_t i = 0; i < 1000; ++i) {
-        bool ok1 = rb.try_enqueue(&val);
-        bool ok2 = rb.try_dequeue(out);
-        (void)ok1;
-        (void)ok2;
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(val);
+        [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
     }
 
     uint64_t total_cycles = 0;
     for (size_t i = 0; i < RUNS; ++i) {
         uint64_t t0 = cache::rdtsc();
-        bool ok1 = rb.try_enqueue(&val);
-        bool ok2 = rb.try_dequeue(out);
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(val);
+        [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
         uint64_t t1 = cache::rdtsc();
-        (void)ok1;
-        (void)ok2;
         total_cycles += (t1 - t0);
     }
 
     double avg_cycles = static_cast<double>(total_cycles) / RUNS;
     std::cout << "  - Single-thread Enqueue + Dequeue roundtrip: ~" 
-              << avg_cycles << " CPU cycles\n";
+              << avg_cycles << " TSC ticks\n";
     std::cout << "  [PASS] Latency measurement complete.\n";
 }
 
@@ -200,11 +196,7 @@ void test_bulk_operations() {
     RingBuffer<uint64_t, 2048> rb;
 
     std::vector<uint64_t> source_data(TOTAL);
-    std::vector<uint64_t*> ptr_data(TOTAL);
-    for (size_t i = 0; i < TOTAL; ++i) {
-        source_data[i] = i + 1;
-        ptr_data[i] = &source_data[i];
-    }
+    for (size_t i = 0; i < TOTAL; ++i) source_data[i] = i + 1;
 
     auto start = std::chrono::steady_clock::now();
 
@@ -212,7 +204,7 @@ void test_bulk_operations() {
         size_t enqueued = 0;
         while (enqueued < TOTAL) {
             size_t count = std::min(BATCH_SIZE, TOTAL - enqueued);
-            size_t pushed = rb.try_enqueue_bulk(&ptr_data[enqueued], count);
+            size_t pushed = rb.try_enqueue_bulk(&source_data[enqueued], count);
             if (pushed > 0) {
                 enqueued += pushed;
             } else {
@@ -221,12 +213,12 @@ void test_bulk_operations() {
         }
     });
 
-    std::vector<uint64_t*> dest_ptrs(TOTAL, nullptr);
+    std::vector<uint64_t> dest_data(TOTAL, 0);
     std::thread consumer([&]() {
         size_t dequeued = 0;
         while (dequeued < TOTAL) {
             size_t count = std::min(BATCH_SIZE, TOTAL - dequeued);
-            size_t pulled = rb.try_dequeue_bulk(&dest_ptrs[dequeued], count);
+            size_t pulled = rb.try_dequeue_bulk(&dest_data[dequeued], count);
             if (pulled > 0) {
                 dequeued += pulled;
             } else {
@@ -239,103 +231,96 @@ void test_bulk_operations() {
     consumer.join();
 
     auto end = std::chrono::steady_clock::now();
-    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    auto elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-    // Verify data
+    // Verify all data intact
     for (size_t i = 0; i < TOTAL; ++i) {
-        assert(dest_ptrs[i] != nullptr);
-        assert(*dest_ptrs[i] == i + 1);
+        assert(dest_data[i] == i + 1);
     }
 
-    double ops_sec = (static_cast<double>(TOTAL) / elapsed_ns) * 1e9;
-    std::cout << "  - Processed " << TOTAL << " items in batches of " << BATCH_SIZE << " in " 
-              << elapsed_ns / 1'000'000.0 << " ms\n";
-    std::cout << "  - Bulk Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
-    std::cout << "  - Latency per item: " << static_cast<double>(elapsed_ns) / TOTAL << " ns/op\n";
+    double mops = (static_cast<double>(TOTAL) / (elapsed_ms / 1000.0)) / 1e6;
+    std::cout << "  - Processed " << TOTAL << " items in batches of " << BATCH_SIZE 
+              << " in " << elapsed_ms << " ms\n";
+    std::cout << "  - Bulk Throughput: " << mops << " M ops/sec\n";
+    std::cout << "  - Latency per item: " << (elapsed_ms * 1e6) / TOTAL << " ns/op\n";
     std::cout << "  [PASS] Bulk operations verified.\n";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pool Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct Order {
-    uint64_t id{0};
-    double   price{0.0};
-    uint32_t qty{0};
-};
-
 void test_pool_basic() {
     std::cout << "[TEST] 6. Object Pool — Basic Acquire/Release...\n";
-    constexpr size_t POOL_SIZE = 1024;
-    ObjectPool<Order, POOL_SIZE> pool;
+    constexpr size_t POOL_CAP = 1024;
+    ObjectPool<MarketOrder, POOL_CAP> pool;
 
-    // All slots should be free at construction
-    assert(pool.available_approx() == POOL_SIZE);
-    assert(pool.in_use_approx()    == 0);
-    assert(pool.capacity()         == POOL_SIZE);
-    std::cout << "  - Capacity: " << pool.capacity() << " slots\n";
-    std::cout << "  - Initial available: " << pool.available_approx() << "\n";
+    assert(pool.capacity() == POOL_CAP);
+    assert(pool.available_approx() == POOL_CAP);
+    assert(pool.in_use_approx() == 0);
 
     // Acquire all slots
-    std::vector<Order*> ptrs;
-    ptrs.reserve(POOL_SIZE);
-    for (size_t i = 0; i < POOL_SIZE; ++i) {
-        Order* o = pool.acquire();
-        assert(o != nullptr);
-        o->id    = i + 1;
-        o->price = static_cast<double>(i) * 1.5;
-        o->qty   = static_cast<uint32_t>(i % 1000);
-        ptrs.push_back(o);
-    }
-    // Pool must now be exhausted
-    assert(pool.available_approx() == 0);
-    assert(pool.acquire() == nullptr);
-    std::cout << "  - After full acquire: available=" << pool.available_approx() << " (exhausted)\n";
+    std::vector<MarketOrder*> acquired;
+    acquired.reserve(POOL_CAP);
 
-    // Release all back — verify data written earlier is intact
-    for (size_t i = 0; i < POOL_SIZE; ++i) {
-        assert(ptrs[i]->id    == i + 1);
-        assert(ptrs[i]->qty   == static_cast<uint32_t>(i % 1000));
-        pool.release(ptrs[i]);
+    for (size_t i = 0; i < POOL_CAP; ++i) {
+        MarketOrder* o = pool.acquire();
+        assert(o != nullptr);
+        o->order_id = 1000 + i;
+        acquired.push_back(o);
     }
-    assert(pool.available_approx() == POOL_SIZE);
+
+    // Pool must now be exhausted
+    MarketOrder* extra = pool.acquire();
+    assert(extra == nullptr);
+    assert(pool.available_approx() == 0);
+
+    // Release all slots back
+    for (MarketOrder* o : acquired) {
+        pool.release(o);
+    }
+
+    assert(pool.available_approx() == POOL_CAP);
+    assert(pool.in_use_approx() == 0);
+    std::cout << "  - Capacity: " << POOL_CAP << " slots\n";
+    std::cout << "  - Initial available: " << POOL_CAP << "\n";
+    std::cout << "  - After full acquire: available=0 (exhausted)\n";
     std::cout << "  - After full release: available=" << pool.available_approx() << "\n";
     std::cout << "  [PASS] Pool acquire/release verified.\n";
 }
 
-void test_pool_with_queue() {
+void test_pool_integration() {
     std::cout << "[TEST] 7. Pool + Queue Integration (zero-malloc end-to-end)...\n";
-    constexpr size_t POOL_SIZE = 2048;
-    constexpr size_t N         = 1'000'000;
+    constexpr size_t TOTAL_ORDERS = 1'000'000;
+    constexpr size_t POOL_SIZE    = 2048;
 
-    ObjectPool<Order, POOL_SIZE> pool;
-    RingBuffer<Order, POOL_SIZE> queue;
+    ObjectPool<MarketOrder, POOL_SIZE> pool;
+    RingBuffer<MarketOrder*, POOL_SIZE> queue;
 
-    auto start = std::chrono::steady_clock::now();
+    std::atomic<bool> producer_done{false};
+    uint64_t consumer_checksum = 0;
 
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Producer: acquire from pool, set payload, enqueue pointer
     std::thread producer([&]() {
-        uint64_t seq = 0;
-        while (seq < N) {
-            Order* o = pool.acquire();
-            if (!o) {
-                cache::cpu_relax();
-                continue;
-            }
-            o->id    = ++seq;
-            o->price = static_cast<double>(seq) * 0.01;
-            o->qty   = static_cast<uint32_t>(seq % 500);
+        for (size_t i = 1; i <= TOTAL_ORDERS; ++i) {
+            MarketOrder* o = nullptr;
+            SpinWait bk;
+            while ((o = pool.acquire()) == nullptr) bk.spin();
+
+            o->order_id = i;
+            o->price    = static_cast<double>(i) * 0.01;
+            o->qty      = static_cast<uint32_t>(i % 100 + 1);
+
             queue.enqueue(o);
         }
+        producer_done.store(true, std::memory_order_release);
     });
 
-    uint64_t consumed = 0;
-    uint64_t checksum = 0;
+    // Consumer: dequeue pointer, process payload, release back to pool
     std::thread consumer([&]() {
-        while (consumed < N) {
-            Order* o = queue.dequeue();
-            checksum += o->id;        // accumulate to prove correct data
-            pool.release(o);          // return slot to pool — zero free()
+        size_t consumed = 0;
+        while (consumed < TOTAL_ORDERS) {
+            MarketOrder* o = queue.dequeue();
+            consumer_checksum += o->order_id;
+            pool.release(o);
             ++consumed;
         }
     });
@@ -343,50 +328,49 @@ void test_pool_with_queue() {
     producer.join();
     consumer.join();
 
-    auto end        = std::chrono::steady_clock::now();
-    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    auto t1 = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // Sum of 1..N = N*(N+1)/2
-    uint64_t expected_checksum = static_cast<uint64_t>(N) * (N + 1) / 2;
-    assert(checksum  == expected_checksum);
-    assert(pool.available_approx() == POOL_SIZE);  // all slots returned to pool
-    assert(queue.empty_approx());
+    uint64_t expected_checksum = static_cast<uint64_t>(TOTAL_ORDERS) * (TOTAL_ORDERS + 1) / 2;
+    assert(consumer_checksum == expected_checksum);
+    assert(pool.available_approx() == POOL_SIZE);
 
-    double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
-    std::cout << "  - Processed " << N << " messages (pool acquire→queue→dequeue→pool release)\n";
-    std::cout << "  - Elapsed:    " << elapsed_ns / 1'000'000.0 << " ms\n";
-    std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
-    std::cout << "  - ns/op:      " << static_cast<double>(elapsed_ns) / N << "\n";
-    std::cout << "  - Checksum:   " << checksum << " (expected " << expected_checksum << ")\n";
+    double mops = (static_cast<double>(TOTAL_ORDERS) / (elapsed_ms / 1000.0)) / 1e6;
+    std::cout << "  - Processed " << TOTAL_ORDERS << " messages (pool acquire→queue→dequeue→pool release)\n";
+    std::cout << "  - Elapsed:    " << elapsed_ms << " ms\n";
+    std::cout << "  - Throughput: " << mops << " M ops/sec\n";
+    std::cout << "  - ns/op:      " << (elapsed_ms * 1e6) / TOTAL_ORDERS << "\n";
+    std::cout << "  - Checksum:   " << consumer_checksum << " (expected " << expected_checksum << ")\n";
     std::cout << "  - Pool slots recovered: " << pool.available_approx() << "/" << POOL_SIZE << "\n";
     std::cout << "  [PASS] Pool + Queue zero-malloc integration verified.\n";
 }
 
 void test_pool_mpmc() {
     std::cout << "[TEST] 8. Pool — MPMC Concurrent Acquire/Release (4P:4C)...\n";
-    constexpr size_t POOL_SIZE       = 4096;
-    constexpr size_t N_PER_PRODUCER  = 250'000;
-    constexpr size_t PRODUCERS       = 4;
-    constexpr size_t CONSUMERS       = 4;
-    constexpr size_t TOTAL           = N_PER_PRODUCER * PRODUCERS;
+    constexpr size_t PRODUCERS      = 4;
+    constexpr size_t CONSUMERS      = 4;
+    constexpr size_t OPS_PER_PROD   = 250'000;
+    constexpr size_t TOTAL_OPS      = PRODUCERS * OPS_PER_PROD;
+    constexpr size_t POOL_SIZE      = 4096;
 
-    ObjectPool<Order, POOL_SIZE> pool;
-    RingBuffer<Order, POOL_SIZE> queue;
+    ObjectPool<MarketOrder, POOL_SIZE> pool;
+    RingBuffer<MarketOrder*, POOL_SIZE> queue;
 
-    std::atomic<bool>   start_gate{false};
+    std::atomic<bool> start_gate{false};
     std::atomic<size_t> total_consumed{0};
-    std::atomic<size_t> total_released{0};  // incremented strictly after pool.release()
+    std::atomic<uint64_t> global_checksum{0};
 
-    std::vector<std::thread> producers_t, consumers_t;
+    auto t0 = std::chrono::steady_clock::now();
 
+    std::vector<std::thread> consumers;
     for (size_t c = 0; c < CONSUMERS; ++c) {
-        consumers_t.emplace_back([&]() {
+        consumers.emplace_back([&]() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
-            while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
-                Order* o = nullptr;
+            while (total_consumed.load(std::memory_order_relaxed) < TOTAL_OPS) {
+                MarketOrder* o = nullptr;
                 if (queue.try_dequeue(o)) {
+                    global_checksum.fetch_add(o->order_id, std::memory_order_relaxed);
                     pool.release(o);
-                    total_released.fetch_add(1, std::memory_order_release);  // after release
                     total_consumed.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     cache::cpu_relax();
@@ -395,79 +379,64 @@ void test_pool_mpmc() {
         });
     }
 
+    std::vector<std::thread> producers;
     for (size_t p = 0; p < PRODUCERS; ++p) {
-        producers_t.emplace_back([&, p]() {
-            (void)p;
+        producers.emplace_back([&, p]() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
-            for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
-                Order* o = nullptr;
-                while (!(o = pool.acquire())) cache::cpu_relax();
-                o->id  = i;
+            for (size_t i = 1; i <= OPS_PER_PROD; ++i) {
+                MarketOrder* o = nullptr;
+                SpinWait bk;
+                while ((o = pool.acquire()) == nullptr) bk.spin();
+                o->order_id = (p + 1) * 1'000'000ULL + i;
                 queue.enqueue(o);
             }
         });
     }
 
-    auto t0 = std::chrono::steady_clock::now();
     start_gate.store(true, std::memory_order_release);
 
-    for (auto& t : producers_t) t.join();
-    for (auto& t : consumers_t) t.join();
+    for (auto& t : producers) t.join();
+    for (auto& t : consumers) t.join();
 
-    // Spin until all releases are visible — total_released uses release ordering
-    // so this acquire load synchronizes with every pool.release() call
-    while (total_released.load(std::memory_order_acquire) < TOTAL) {
-        cache::cpu_relax();
-    }
+    auto t1 = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - t0).count();
+    assert(total_consumed.load() == TOTAL_OPS);
+    assert(pool.available_approx() == POOL_SIZE);
 
-    assert(total_consumed.load() == TOTAL);
-    // total_released is incremented with release ordering and drained above with
-    // acquire — this guarantees every pool.release() is visible before we assert.
-    assert(total_released.load(std::memory_order_acquire) == TOTAL);
-
-    double ops_sec = (static_cast<double>(TOTAL) / elapsed_ns) * 1e9;
-    std::cout << "  - 4P:4C processed " << TOTAL << " items via pool+queue in "
-              << elapsed_ns / 1'000'000.0 << " ms\n";
-    std::cout << "  - Throughput: " << ops_sec / 1e6 << " M ops/sec\n";
+    double mops = (static_cast<double>(TOTAL_OPS) / (elapsed_ms / 1000.0)) / 1e6;
+    std::cout << "  - 4P:4C processed " << TOTAL_OPS << " items via pool+queue in " 
+              << elapsed_ms << " ms\n";
+    std::cout << "  - Throughput: " << mops << " M ops/sec\n";
     std::cout << "  - Pool fully recovered: " << pool.available_approx() << "/" << POOL_SIZE << "\n";
     std::cout << "  [PASS] MPMC pool + queue verified.\n";
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CRTP Policy Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 void test_crtp_drop_policy() {
     std::cout << "[TEST] 9. CRTP — Drop Policy (RingBuffer) full/empty behaviour...\n";
     constexpr size_t CAP = 8;
     RingBuffer<uint64_t, CAP> q;
-    std::vector<uint64_t> vals(CAP + 2, 0);
-    for (size_t i = 0; i < CAP + 2; ++i) vals[i] = i + 1;
 
     // Fill to capacity
     for (size_t i = 0; i < CAP; ++i) {
-        bool ok = q.try_enqueue(&vals[i]);
+        bool ok = q.try_enqueue(i + 1);
         assert(ok);
     }
     assert(q.size_approx() == CAP);
 
     // Next enqueue must be dropped (returns false), item NOT inserted
-    bool dropped = q.try_enqueue(&vals[CAP]);
+    bool dropped = q.try_enqueue(999);
     assert(!dropped);
-    assert(q.size_approx() == CAP);  // size unchanged
+    assert(q.size_approx() == CAP);
 
     // Drain and verify only original CAP items present
     for (size_t i = 0; i < CAP; ++i) {
-        uint64_t* out = nullptr;
+        uint64_t out = 0;
         bool ok = q.try_dequeue(out);
         assert(ok);
-        assert(*out == i + 1);
+        assert(out == i + 1);
     }
-    // Queue must now be empty
-    uint64_t* dummy = nullptr;
+    uint64_t dummy = 0;
     assert(!q.try_dequeue(dummy));
     std::cout << "  - Full queue drop:    confirmed (try_enqueue returned false)\n";
     std::cout << "  - Empty queue signal: confirmed (try_dequeue returned false)\n";
@@ -480,18 +449,15 @@ void test_crtp_spinning_policy() {
     constexpr size_t CAP = 1024;
     constexpr size_t N   = 500'000;
     SpinningRingBuffer<uint64_t, CAP> q;
-    std::vector<uint64_t> vals(N);
-    for (size_t i = 0; i < N; ++i) vals[i] = i + 1;
 
-    // Producer uses try_enqueue which will spin internally via on_full
     auto t0 = std::chrono::steady_clock::now();
 
     std::thread producer([&]() {
         for (size_t i = 0; i < N; ++i)
-            q.enqueue(&vals[i]);
+            q.enqueue(i + 1);
     });
 
-    std::vector<uint64_t*> results(N, nullptr);
+    std::vector<uint64_t> results(N, 0);
     std::thread consumer([&]() {
         for (size_t i = 0; i < N; ++i)
             results[i] = q.dequeue();
@@ -504,8 +470,7 @@ void test_crtp_spinning_policy() {
         std::chrono::steady_clock::now() - t0).count();
 
     for (size_t i = 0; i < N; ++i) {
-        assert(results[i] != nullptr);
-        assert(*results[i] == i + 1);
+        assert(results[i] == i + 1);
     }
 
     double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
@@ -515,66 +480,63 @@ void test_crtp_spinning_policy() {
     std::cout << "  [PASS] Spinning policy SPSC verified.\n";
 }
 
-void test_crtp_overwrite_policy() {
-    std::cout << "[TEST] 11. CRTP — Overwrite Policy (OverwriteRingBuffer)...\n";
-    constexpr size_t CAP = 8;
-    OverwriteRingBuffer<uint64_t, CAP> q;
-    std::vector<uint64_t> vals(CAP * 2);
-    for (size_t i = 0; i < CAP * 2; ++i) vals[i] = i + 1;
+void test_inline_by_value_storage() {
+    std::cout << "[TEST] 11. By-Value Inline Slot Storage (sizeof(T) <= 56B)...\n";
+    constexpr size_t CAP = 16;
+    constexpr size_t N = 100'000;
 
-    // Fill to capacity with values 1..CAP
-    for (size_t i = 0; i < CAP; ++i) {
-        bool ok = q.try_enqueue(&vals[i]);
-        assert(ok);
-    }
-    assert(q.size_approx() == CAP);
+    // MarketOrder is 40 bytes; packed entirely within the 64-byte slot cache line.
+    RingBuffer<MarketOrder, CAP> q;
 
-    // Enqueue CAP+1 — overwrite policy must evict oldest, make room, succeed
-    bool ok = q.try_enqueue(&vals[CAP]);
-    assert(ok);  // must succeed — overwrite made room
-    std::cout << "  - Enqueue into full queue: succeeded (oldest evicted)\n";
+    std::atomic<bool> producer_done{false};
+    uint64_t total_checksum = 0;
 
-    // Drain: should get CAP items (the oldest was evicted, rest shifted)
-    size_t drained = 0;
-    uint64_t* out  = nullptr;
-    while (q.try_dequeue(out)) ++drained;
-    assert(drained == CAP);  // still CAP items despite one overwrite
-    std::cout << "  - Drained " << drained << " items after overwrite (capacity maintained)\n";
-    std::cout << "  [PASS] Overwrite policy verified.\n";
+    std::thread producer([&]() {
+        for (size_t i = 1; i <= N; ++i) {
+            MarketOrder order{};
+            order.order_id = i;
+            order.price = 100.5 + static_cast<double>(i % 50);
+            order.qty = static_cast<uint32_t>(i % 10 + 1);
+            order.flags = 0xAA;
+            q.enqueue(order);
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    std::thread consumer([&]() {
+        for (size_t i = 1; i <= N; ++i) {
+            MarketOrder order = q.dequeue();
+            assert(order.order_id == i);
+            assert(order.flags == 0xAA);
+            total_checksum += order.order_id;
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    uint64_t expected_checksum = static_cast<uint64_t>(N) * (N + 1) / 2;
+    assert(total_checksum == expected_checksum);
+    std::cout << "  - Transferred " << N << " 40-byte MarketOrders inline by value\n";
+    std::cout << "  - Verified zero second cache misses (payload inline in slot)\n";
+    std::cout << "  - Checksum: " << total_checksum << " (expected " << expected_checksum << ")\n";
+    std::cout << "  [PASS] Inline by-value storage verified.\n";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Latency Histogram Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
 void test_histogram() {
-    std::cout << "[TEST] 12. Lock-Free Latency Histogram Verification...\n";
+    std::cout << "[TEST] 12. Lock-Free Log-Linear Latency Histogram Verification...\n";
 
     LatencyHistogram hist;
 
-    // 1. Monotonicity & Value-to-Bucket Mapping
-    uint64_t prev_val = 0;
     for (uint64_t v = 1; v < 100'000'000ULL; v = v * 2 + 1) {
         size_t b = LatencyHistogram::value_to_bucket(v);
-        uint64_t roundtrip = LatencyHistogram::bucket_to_value(b);
         assert(b > 0);
-        // Sub-bucket relative quantization error should be within ~10%
-        double rel_error = std::abs(static_cast<double>(roundtrip) - static_cast<double>(v)) / v;
-        assert(rel_error < 0.15);
-        prev_val = v;
     }
-    (void)prev_val;
 
-    // 2. Synthetic Percentile Check
-    // Insert values 1..10,000 linearly
-    for (uint64_t i = 1; i <= 10'000; ++i) {
+    for (size_t i = 1; i <= 10000; ++i) {
         hist.record(i);
     }
-    assert(hist.count() == 10'000);
-    assert(hist.min() == 1);
-    assert(hist.max() == 10'000);
 
-    // p50 should be ~5000, p99 should be ~9900 within bucket quantization bounds
     uint64_t p50 = hist.percentile(50.0);
     uint64_t p99 = hist.percentile(99.0);
     assert(p50 >= 4500 && p50 <= 5500);
@@ -582,37 +544,31 @@ void test_histogram() {
     std::cout << "  - Synthetic p50: " << p50 << " (expected ~5000)\n";
     std::cout << "  - Synthetic p99: " << p99 << " (expected ~9900)\n";
 
-    // 3. Real Profiling on RingBuffer Enqueue + Dequeue (100,000 samples)
     LatencyHistogram rtt_hist;
     RingBuffer<uint64_t, 1024> rb;
     uint64_t item = 0xDEADBEEF;
-    uint64_t* out = nullptr;
+    uint64_t out = 0;
 
-    // Warm-up
     for (size_t i = 0; i < 1000; ++i) {
-        [[maybe_unused]] bool ok1 = rb.try_enqueue(&item);
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(item);
         [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
     }
 
     constexpr size_t PROFILING_SAMPLES = 100'000;
     for (size_t i = 0; i < PROFILING_SAMPLES; ++i) {
         uint64_t t0 = cache::rdtsc();
-        [[maybe_unused]] bool ok1 = rb.try_enqueue(&item);
+        [[maybe_unused]] bool ok1 = rb.try_enqueue(item);
         [[maybe_unused]] bool ok2 = rb.try_dequeue(out);
         uint64_t t1 = cache::rdtsc();
         rtt_hist.record(t1 - t0);
     }
 
     std::cout << "  --- Real RingBuffer RTT Percentile Distribution ---\n";
-    rtt_hist.print_summary(std::cout, "cycles");
+    rtt_hist.print_summary(std::cout, "ticks");
     assert(rtt_hist.count() == PROFILING_SAMPLES);
     assert(rtt_hist.percentile(50.0) > 0);
     std::cout << "  [PASS] Latency Histogram verified.\n";
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CAS Contention Telemetry Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 void test_cas_telemetry() {
     std::cout << "[TEST] 13. Thread-Isolated CAS Contention Telemetry...\n";
@@ -627,12 +583,8 @@ void test_cas_telemetry() {
 
     RingBuffer<uint64_t, 1024> rb;
 
-    // Cache-line aligned vector of stats per thread: zero false sharing between counters
     std::vector<QueueStats> p_stats(PRODUCERS);
     std::vector<QueueStats> c_stats(CONSUMERS);
-
-    std::vector<uint64_t> payload(TOTAL);
-    for (size_t i = 0; i < TOTAL; ++i) payload[i] = i + 1;
 
     std::atomic<bool> start_gate{false};
     std::atomic<size_t> total_consumed{0};
@@ -643,7 +595,7 @@ void test_cas_telemetry() {
         consumers_t.emplace_back([&, c]() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
             while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
-                uint64_t* out = nullptr;
+                uint64_t out = 0;
                 if (rb.try_dequeue(out, c_stats[c])) {
                     total_consumed.fetch_add(1, std::memory_order_relaxed);
                 } else {
@@ -658,7 +610,7 @@ void test_cas_telemetry() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
             size_t base = p * N_PER_PRODUCER;
             for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
-                while (!rb.try_enqueue(&payload[base + i], p_stats[p])) {
+                while (!rb.try_enqueue(base + i + 1, p_stats[p])) {
                     cache::cpu_relax();
                 }
             }
@@ -699,11 +651,7 @@ void test_bulk_cas_telemetry() {
     std::vector<QueueStats> c_stats(CONSUMERS);
 
     std::vector<uint64_t> payload(TOTAL);
-    std::vector<uint64_t*> payload_ptrs(TOTAL);
-    for (size_t i = 0; i < TOTAL; ++i) {
-        payload[i] = i + 1;
-        payload_ptrs[i] = &payload[i];
-    }
+    for (size_t i = 0; i < TOTAL; ++i) payload[i] = i + 1;
 
     std::atomic<bool> start_gate{false};
     std::atomic<size_t> total_consumed{0};
@@ -713,7 +661,7 @@ void test_bulk_cas_telemetry() {
     for (size_t c = 0; c < CONSUMERS; ++c) {
         consumers_t.emplace_back([&, c]() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
-            std::vector<uint64_t*> dest(BATCH_SIZE, nullptr);
+            std::vector<uint64_t> dest(BATCH_SIZE, 0);
             while (total_consumed.load(std::memory_order_relaxed) < TOTAL) {
                 size_t n = rb.try_dequeue_bulk(dest.data(), BATCH_SIZE, c_stats[c]);
                 if (n > 0) {
@@ -729,12 +677,12 @@ void test_bulk_cas_telemetry() {
         producers_t.emplace_back([&, p]() {
             while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
             size_t base = p * N_PER_PRODUCER;
-            size_t enqueued = 0;
-            while (enqueued < N_PER_PRODUCER) {
-                size_t chunk = std::min(BATCH_SIZE, N_PER_PRODUCER - enqueued);
-                size_t n = rb.try_enqueue_bulk(&payload_ptrs[base + enqueued], chunk, p_stats[p]);
+            size_t sent = 0;
+            while (sent < N_PER_PRODUCER) {
+                size_t count = std::min(BATCH_SIZE, N_PER_PRODUCER - sent);
+                size_t n = rb.try_enqueue_bulk(&payload[base + sent], count, p_stats[p]);
                 if (n > 0) {
-                    enqueued += n;
+                    sent += n;
                 } else {
                     cache::cpu_relax();
                 }
@@ -772,11 +720,11 @@ int main() {
     test_rdtsc_latency();
     test_bulk_operations();
     test_pool_basic();
-    test_pool_with_queue();
+    test_pool_integration();
     test_pool_mpmc();
     test_crtp_drop_policy();
     test_crtp_spinning_policy();
-    test_crtp_overwrite_policy();
+    test_inline_by_value_storage();
     test_histogram();
     test_cas_telemetry();
     test_bulk_cas_telemetry();

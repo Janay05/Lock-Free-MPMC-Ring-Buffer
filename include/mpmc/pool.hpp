@@ -149,7 +149,7 @@ private:
     // Holds T* pointers to slots within storage_[].
     // At full capacity: Capacity pointers in queue → all slots free.
     // At zero:          0 pointers in queue       → all slots in use.
-    RingBuffer<T, Capacity> free_list_;
+    RingBuffer<T*, Capacity> free_list_;
 };
 
 } // namespace mpmc
