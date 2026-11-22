@@ -2,7 +2,7 @@
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20(x86--64)-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20(x86--64%20%7C%20AArch64)-lightgrey.svg)]()
 
 A header-only, zero-syscall, lock-free Multi-Producer Multi-Consumer (MPMC) ring buffer queue engineered in **C++20** for ultra-low latency execution environments and high-frequency trading (HFT) data feeds.
 
@@ -12,29 +12,32 @@ Built from first principles around **cache-line isolation**, **bounded atomic se
 
 ## Performance Highlights
 
-Benchmarked natively on an **Intel® Core™ i7-14700HX (Raptor Lake, P-Cores pinned at Time-Critical Priority)**:
+Measured on physical P-Cores pinned with high priority (**Intel® Core™ i7-14700HX, Raptor Lake**):
 
 | Metric | Measurement | Description |
 |---|---|---|
-| **Bulk Throughput (Batch = 32)** | **541.14 Million ops/sec** | ~1.84 ns per item across pinned physical cores |
-| **SPSC Cross-Core Latency (p50)** | **~21 ns** (96 CPU cycles) | Hardware cache-transfer RTT / 2 over CPU interconnect |
-| **SPSC Cross-Core Latency (p99)** | **~40 ns** (184 CPU cycles) | Tail latency under continuous transmission |
-| **Contention Storm Reduction** | **64.4% $\to$ 1.15%** | Amortizing CAS across batches virtually eliminates bus locks |
+| **Single-Item Cross-Core Latency (p50)** | **~21 ns** (96 TSC cycles) | Hardware cross-core cache transfer RTT / 2 over CPU ring interconnect |
+| **Single-Item Cross-Core Latency (p99)** | **~40 ns** (184 TSC cycles) | Tail latency under continuous single-item transmission |
+| **Single-Item SPSC Throughput** | **~64.35 Million ops/sec** | ~15.5 ns per unbatched item transmission across cores |
+| **Batched Bulk Throughput (Batch = 32)** | **541.14 Million ops/sec** | ~1.84 ns per item when amortizing atomic CAS across batches |
+| **Contention Storm Reduction** | **64.4% $\to$ 1.15%** | Pause backoff + bulk CAS dramatically suppresses bus locks |
 | **Zero Memory Allocation** | **0 bytes** | Zero calls to `malloc`/`new` on hot enqueue/dequeue paths |
+
+> *Note: For full measurement details, invariant TSC derivations, and data accounting disclosures, see [Benchmark Environment & Data Accounting](#benchmark-environment--data-accounting).*
 
 ---
 
 ## Architectural Principles
 
 ```
-  Producer Core 0  ──┐                               ┌──  Consumer Core 4
-  Producer Core 1  ──┼──> [ Lock-Free MPMC Ring ] ──┼──>  Consumer Core 5
-  Producer Core 2  ──┘       (Power-of-2 Sized)      └──  Consumer Core 6
+  Producer Core 0  ───┐                                ┌───  Consumer Core 4
+  Producer Core 1  ───┼──> [ Lock-Free MPMC Ring ] ───┼──>  Consumer Core 5
+  Producer Core 2  ───┘       (Power-of-2 Sized)      └───  Consumer Core 6
 ```
 
-### 1. 64-Byte Cache Line Isolation (Zero False Sharing)
-On modern x86-64 hardware, the L1 data cache operates in 64-byte lines. If multiple threads write to distinct variables located on the same 64-byte line, CPU hardware generates constant cache-coherency invalidations (the MESI protocol ping-pong effect).
-* **Each Slot is exactly 64 bytes**:
+### 1. 64-Byte Cache Line Isolation (False Sharing Mitigation)
+On modern x86-64 and ARM64 architectures, the L1 data cache operates in 64-byte lines. If multiple cores write to distinct variables located on the same 64-byte line, hardware coherency protocols (MESI/MOESI) invalidate the line back and forth across cores (cache ping-pong).
+* **Each Slot is isolated to 64 bytes**:
   ```
   ┌─────────────────────────────────────────────────────────────┐
   │  Byte 0–7   │  sequence  │  atomic<size_t>   (8 bytes)      │
@@ -43,50 +46,56 @@ On modern x86-64 hardware, the L1 data cache operates in 64-byte lines. If multi
   └─────────────────────────────────────────────────────────────┘
                 Total: 8 + 8 + 48 = 64 bytes = 1 Cache Line
   ```
-* **Independent `head_` and `tail_`**: Producers hammer `head_` and consumers hammer `tail_`. They reside on distinct 64-byte cache lines separated by trailing padding to ensure zero false sharing.
+  Adjacent slots never share a cache line, eliminating slot-to-slot false sharing.
+* **Independent `head_` and `tail_`**: Producers contend on `head_` and consumers contend on `tail_`. They reside on distinct 64-byte cache lines separated by trailing padding to prevent cross-producer/consumer false sharing.
 
-### 2. Dmitry Vyukov Sequence Handshake
-Instead of locking a global index or contending directly on head/tail, synchronization is governed by an atomic `sequence` ticket embedded in every slot:
+### 2. Dmitry Vyukov Sequence Ticket Handshake
+Instead of locking a global mutex or relying on a centralized counter, synchronization is governed by an atomic `sequence` ticket embedded in every slot:
 * **Initial State**: Slot $i$ holds `sequence = i`.
-* **Producer Step**: Producer checks if `slot->sequence == pos`. On atomic CAS claim of `head_`, it writes `slot->data` and releases `sequence = pos + 1`.
-* **Consumer Step**: Consumer checks if `slot->sequence == pos + 1`. On atomic CAS claim of `tail_`, it reads `slot->data` and releases `sequence = pos + Capacity`.
-* **ABA Safety**: Monotonically increasing 64-bit tickets only wrap after $2^{64}$ operations, making ABA impossible in practice.
+* **Producer Handshake**: Producer checks if `slot->sequence == pos`. Upon atomic CAS claim of `head_`, it writes `slot->data` and executes a `release` store on `sequence = pos + 1`.
+* **Consumer Handshake**: Consumer checks if `slot->sequence == pos + 1`. Upon atomic CAS claim of `tail_`, it reads `slot->data` and executes a `release` store on `sequence = pos + Capacity`.
+* **Generational Wrapping**: Incrementing by `pos + Capacity` (rather than `pos + 1`) acts as a generation sentinel, ensuring producers on wrap-around generation $N+1$ never mistake an unread generation $N$ slot as free. 64-bit tickets eliminate ABA in practice.
 
-### 3. Zero Kernel Syscalls & Pure Hardware Pause
-* Any invocation of `std::this_thread::yield()` or `sleep()` triggers a kernel context switch, costing **1,000 to 5,000+ nanoseconds**.
-* The backoff engine operates strictly in user space via `_mm_pause` (`rep nop`, opcode `F3 90`), de-pipelining the CPU speculative execution unit and reducing core power without yielding the core time-slice.
+### 3. User-Space Spin-Wait & Hardware Pause Backoff
+* Yielding via `sched_yield` or sleep primitives transitions the thread into the OS scheduler, introducing involuntary descheduling and latency spikes ranging from hundreds of nanoseconds to several microseconds under scheduler queue depth.
+* The backoff engine operates strictly in user space via architecture-specific pause hints:
+  * **x86-64**: `_mm_pause` (`rep nop`, opcode `F3 90`). As specified in Intel SDM Vol. 2B, `PAUSE` introduces a finite delay loop serialization, prevents speculative memory order mispredictions on pipeline exit from tight spin loops, and reduces core power consumption.
+  * **AArch64**: `yield` instruction (ARM DDI 0487), providing a hardware spin hint to the CPU core.
+  * **RISC-V**: Standardized `nop` fallback.
 
 ### 4. Static Polymorphism (CRTP) Over Virtual Functions
-Zero virtual functions and zero runtime vtables. All policy dispatching is resolved at compile time:
-* `RingBuffer<T, Cap>`: Default **Drop policy** (non-blocking, returns `false` on full).
-* `SpinningRingBuffer<T, Cap>`: **Spin-wait policy** (spins with `_mm_pause` until slot is freed).
-* `OverwriteRingBuffer<T, Cap>`: **Overwrite policy** (force-evicts oldest item, ideal for top-of-book market feeds).
+Zero virtual functions, zero vtable pointers, and zero runtime branch indirections. Queue overflow/underflow policies are resolved at compile time:
+* `RingBuffer<T, Cap>`: **Drop policy** (non-blocking, returns `false` on full/empty).
+* `SpinningRingBuffer<T, Cap>`: **Spin-wait policy** (spins with `cpu_relax()` until space/item appears).
+* `OverwriteRingBuffer<T, Cap>`: **Overwrite-oldest policy** (advances tail to evict oldest unread item; specialized for loss-tolerant market data feeds).
 
-### 5. Lock-Free Slab Object Pool (`pool.hpp`)
-Moving 8-byte pointers avoids copying payloads, but dynamic heap allocation (`new Order()`) in trading loops introduces allocator mutex contention. `ObjectPool<T, Capacity>` pre-allocates contiguous memory at initialization and manages free instances through an internal ring buffer with zero dynamic allocations on `acquire()` / `release()`.
+### 5. Slab Object Pool Architecture (`pool.hpp`)
+Transferring 8-byte pointers avoids copying large payloads (such as 64-byte market orders) through the ring buffer. However, heap allocations (`new Order()`) in trading loops introduce allocator lock contention. `ObjectPool<T, Capacity>` pre-allocates contiguous memory at initialization and manages available slots through an internal lock-free ring buffer, achieving zero allocations on the hot path.
 
 ---
 
 ## Code Examples
 
-### 1. Basic Enqueue and Dequeue
+### 1. Basic Enqueue and Dequeue (Safe Memory Model)
 ```cpp
 #include "mpmc/ring_buffer.hpp"
+#include <iostream>
 
-// Capacity must be a power of 2
+// Queue holds pointers to uint64_t items. Capacity must be a power of 2.
 mpmc::RingBuffer<uint64_t, 1024> queue;
 
-uint64_t order_id = 987654321;
+// Enqueued items should have stable storage (e.g. pool, static, or heap).
+static uint64_t g_order_id = 987654321;
 
-// Non-blocking try_enqueue (returns false if queue is full)
-if (queue.try_enqueue(&order_id)) {
+// Non-blocking try_enqueue (returns false immediately if queue is full)
+if (queue.try_enqueue(&g_order_id)) {
     // Successfully published
 }
 
-// Non-blocking try_dequeue (returns false if queue is empty)
+// Non-blocking try_dequeue (returns false immediately if queue is empty)
 uint64_t* received = nullptr;
 if (queue.try_dequeue(received)) {
-    // Process *received
+    std::cout << "Received order ID: " << *received << "\n";
 }
 ```
 
@@ -105,26 +114,26 @@ struct Order {
 mpmc::ObjectPool<Order, 4096> pool;
 mpmc::RingBuffer<Order, 4096> queue;
 
-// Producer (Zero Malloc)
+// Producer Thread (Zero Malloc)
 Order* o = pool.acquire(); // Lock-free pop from pool
 if (o) {
     o->id = 1001;
     o->price = 150.25;
     o->qty = 50;
-    queue.enqueue(o);
+    queue.enqueue(o);      // Guaranteed publish with spin-wait
 }
 
-// Consumer (Zero Free)
+// Consumer Thread (Zero Free)
 Order* processed = queue.dequeue();
 // ... process trade ...
-pool.release(processed); // Returned to pool for reuse
+pool.release(processed);   // Returned to pool free-list for immediate reuse
 ```
 
 ### 3. High-Throughput Bulk Operations
 ```cpp
-// Claim up to 32 slots in a SINGLE atomic CAS
+// Claim and publish up to 32 slots in a SINGLE atomic CAS
 uint64_t* batch[32];
-// ... populate batch ...
+// ... populate batch pointers ...
 size_t enqueued = queue.try_enqueue_bulk(batch, 32);
 
 // Pull up to 32 slots in a SINGLE atomic CAS
@@ -136,17 +145,47 @@ size_t dequeued = queue.try_dequeue_bulk(out_batch, 32);
 ```cpp
 #include "mpmc/affinity.hpp"
 #include "mpmc/stats.hpp"
+#include <iostream>
 
 // Pin current thread to physical Core 2 with real-time priority
 mpmc::affinity::pin_current_thread_to_core(2);
 mpmc::affinity::set_current_thread_priority_critical();
 
-// Track thread-local CAS collision ratios without cross-thread false sharing
+// Track thread-local CAS collision ratios without cross-thread cache thrashing
 mpmc::QueueStats my_stats;
 queue.try_enqueue(o, my_stats);
 
 std::cout << "CAS Contention Ratio: " << my_stats.enqueue_contention_ratio() << "%\n";
 ```
+
+---
+
+## Benchmark Environment & Data Accounting
+
+To ensure scientific honesty and reproducibility, this section documents the exact benchmarking environment, data definitions, and hardware behavior:
+
+### 1. Hardware & Platform Details
+* **CPU**: Intel® Core™ i7-14700HX (8 Performance Cores, 12 Efficient Cores, 28 Threads).
+* **OS**: Windows 11 (MSYS2 / UCRT64 toolchain, GCC 13.1.0).
+* **Compiler Flags**: `-O3 -march=native -Wall -Wextra -Wpedantic -fno-rtti`.
+* **Thread Priority**: Threads are pinned to physical P-Cores using `SetThreadAffinityMask` with `THREAD_PRIORITY_TIME_CRITICAL`.
+
+> **HFT Deployment Note**: While laptop benchmarking under Windows with high priority verifies lock-free algorithms and relative scaling, production low-latency trading systems operate on bare-metal Linux instances configured with `isolcpus`, `nohz_full`, CPU frequency governor pinned to `performance`, and C-states disabled to prevent P-state frequency governor and scheduler jitter.
+
+### 2. Operation Counting & Payload Accounting
+* **What is an "op"?** In throughput measurements, each op represents a completed transmission of one 8-byte pointer from a producer to a consumer.
+* **Payload Access**: Benchmarks measure queue transport overhead. The consumer receives the pointer without dereferencing or dirtying cold payload bytes. In production, pairing with `ObjectPool` ensures payloads reside in cache during active pipelines.
+* **Bulk vs. Single-Item**:
+  * **Single-Item (1P:1C)**: Measures unbatched single CAS operations per item (~64.35M ops/sec, ~15.5 ns/op).
+  * **Bulk (Batch = 32)**: Measures amortized CAS claims across 32 items simultaneously (541.14M ops/sec, ~1.84 ns/op).
+
+### 3. Timing & Histogram Resolution
+* **Invariant TSC**: On modern x86-64 hardware, the Time Stamp Counter (read via `RDTSC`/`RDTSCP`) is invariant (`invtsc`). It increments at a fixed nominal reference frequency regardless of CPU turbo states or instantaneous clock frequency.
+* **Histogram Quantization**: The lock-free latency histogram buckets values logarithmically using 64 octaves with 16 linear sub-buckets per octave ($O(1)$ bucketing via `__builtin_clzll`). Reported percentiles return the **lower bound** of each sub-bucket. This is why percentiles align to discrete power-of-two multiples (e.g., 96 cycles = $64 + 2 \times 16$; 184 cycles = $128 + 3.5 \times 16$).
+
+### 4. Pointer-Only Slots vs. Value In-line Slots
+Each slot holds an 8-byte pointer (`T*`) and 48 bytes of padding to fill 64 bytes.
+* **Trade-off Justification**: Storing payloads by value inside the ring buffer causes multi-cache-line slots for structs $>56$ bytes, leading to multi-line bus invalidations per operation. Our pointer design pairs with `ObjectPool` so that payloads are managed in pre-warmed slab memory. For payloads that are tiny ($\le 8$ bytes) or when payloads are cold, an in-line value queue avoids the second dereference miss.
 
 ---
 
@@ -161,7 +200,7 @@ mpmc-ring-buffer/
 │       ├── ring_buffer.hpp     # Dmitry Vyukov lock-free core + CRTP policies
 │       ├── pool.hpp            # Lock-free slab object pool (zero dynamic allocation)
 │       ├── slot.hpp            # 64-byte isolated slot layout & static assertions
-│       ├── cache.hpp           # Hardware intrinsics (_mm_pause, prefetch, RDTSC)
+│       ├── cache.hpp           # Hardware intrinsics (_mm_pause, yield, prefetch, RDTSC)
 │       ├── backoff.hpp         # Pure user-space spin-wait backoff
 │       ├── affinity.hpp        # Core pinning & real-time thread priority helpers
 │       ├── stats.hpp           # Thread-isolated CAS collision metrics

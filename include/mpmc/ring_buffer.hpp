@@ -93,53 +93,81 @@ public:
     RingBufferBase& operator=(RingBufferBase&&)      = delete;
 
     // ── Core enqueue ─────────────────────────────────────────────────────────
-    /**
+        /**
      * Non-blocking single-item enqueue.
      *
      * When the queue is full, calls Derived::on_full(item):
      *   - Returns false immediately (DropPolicy)
-     *   - Spins with _mm_pause (SpinningPolicy)
+     *   - Spins with cpu_relax() (SpinningPolicy)
      *   - Advances tail to overwrite oldest item (OverwritePolicy)
      *
-     * Memory ordering:
-     *   slot.sequence load   : acquire  — synchronise with prior release store
-     *   head_ CAS            : relaxed  — sequence handshake provides ordering
-     *   slot.sequence store  : release  — publish written data to consumers
+     * ── Memory ordering rationale ─────────────────────────────────────────────────
+     *
+     * pos = head_.load(relaxed)
+     *   Only a hint; any stale value is safe because the subsequent CAS
+     *   corrects pos on failure.  No ordering required at this read.
+     *
+     * seq = slot->sequence.load(acquire)
+     *   ACQUIRE pairs with the RELEASE store from the last consumer that
+     *   freed this slot: slot->sequence.store(pos + kMask + 1, release).
+     *   We must observe all writes the consumer made to slot->data before
+     *   we overwrite it.  Without acquire we could speculatively read a
+     *   stale sequence value on weakly-ordered ISAs (AArch64, RISC-V).
+     *
+     * head_.compare_exchange_weak(pos, pos+1, relaxed, relaxed)
+     *   The CAS itself does not need acquire/release because the ordering
+     *   guarantee is provided by the slot->sequence handshake: the acquire
+     *   load above and the release store below create a synchronizes-with
+     *   edge between this producer and the consumer.  Relaxed CAS avoids a
+     *   redundant fence.  On x86, LOCK CMPXCHG already implies a full
+     *   barrier; on AArch64/RISC-V the acquire/release on sequence suffice.
+     *   On CAS failure, pos is updated to the actual current head_.
+     *
+     * slot->sequence.store(pos + 1, release)
+     *   RELEASE publishes slot->data to any consumer that acquire-loads
+     *   seq == pos+1.  This is the synchronizes-with edge the consumer
+     *   pairs with.  Without release, a consumer could observe the sequence
+     *   update before slot->data is globally visible on AArch64/RISC-V.
+     * ───────────────────────────────────────────────────────────────────────────
      */
     [[nodiscard]] bool try_enqueue(T* item) noexcept {
-        std::size_t pos = head_.load(std::memory_order_relaxed);
+        std::size_t pos = head_.load(std::memory_order_relaxed); // hint only; CAS corrects stale reads
 
         for (;;) {
             Slot<T>* slot = &slots_[pos & kMask];
+            // acquire: sync with consumer's release that reset this slot to write-ready state
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
 
             if (__builtin_expect(diff == 0, 1)) {
-                // Fast path: slot is ready. Race to claim it.
+                // Slot is write-ready (seq == pos). Race all producers via CAS on head_.
+                // Relaxed CAS: ordering provided by acquire/release on slot->sequence.
                 if (head_.compare_exchange_weak(pos, pos + 1,
                         std::memory_order_relaxed, std::memory_order_relaxed)) {
-                    cache::prefetch_write(&slots_[(pos + 1) & kMask]);
+                    cache::prefetch_write(&slots_[(pos + 1) & kMask]); // RFO for next slot
                     slot->data = item;
+                    // release: publish slot->data; consumer's acquire on seq == pos+1 sees it
                     slot->sequence.store(pos + 1, std::memory_order_release);
                     return true;
                 }
-                // CAS failed — pos now holds the refreshed head; pause to let winning core retire store
+                // CAS lost (pos updated); pause before retrying to reduce bus-lock pressure
                 cache::cpu_relax();
             } else if (diff < 0) {
-                // Queue is full. Delegate to policy.
+                // seq < pos: consumer has not reset this slot from the previous wrap-around.
+                // Queue is full. Delegate to policy (drop / spin / overwrite).
                 if (derived().on_full(item, pos)) {
-                    // Policy handled it (e.g. overwrite advanced tail).
-                    // Reload head and retry the outer loop.
                     pos = head_.load(std::memory_order_relaxed);
                     continue;
                 }
                 return false;
             } else {
-                // Another producer claimed this slot; reload head and retry.
+                // diff > 0: another producer already claimed pos. Reload and retry.
                 pos = head_.load(std::memory_order_relaxed);
             }
         }
     }
+
+
 
     /**
      * Instrumented non-blocking single-item enqueue.
@@ -183,32 +211,65 @@ public:
      *
      * When the queue is empty, calls Derived::on_empty(out):
      *   - Returns false immediately (DropPolicy / OverwritePolicy)
-     *   - Spins with _mm_pause (SpinningPolicy)
+     *   - Spins with cpu_relax() (SpinningPolicy)
+     *
+     * ── Memory ordering rationale ─────────────────────────────────────────────────
+     *
+     * pos = tail_.load(relaxed)
+     *   Hint only. The subsequent CAS corrects stale reads.
+     *
+     * seq = slot->sequence.load(acquire)
+     *   ACQUIRE pairs with the producer's RELEASE store that published
+     *   slot->data: slot->sequence.store(pos + 1, release).
+     *   Without acquire, slot->data could be read before the producer's
+     *   store is globally visible on AArch64/RISC-V.
+     *
+     * tail_.compare_exchange_weak(pos, pos+1, relaxed, relaxed)
+     *   Relaxed: ordering provided by acquire/release on slot->sequence.
+     *   On CAS failure, pos is updated with the current tail_.
+     *
+     * slot->sequence.store(pos + kMask + 1, release)
+     *   RELEASE resets the slot to write-ready for the NEXT wrap-around.
+     *   pos + kMask + 1 == pos + Capacity (since kMask == Capacity - 1).
+     *   The next producer to claim this slot's position will acquire-load
+     *   this value as seq == next_pos, confirming the slot is free.
+     *   Why pos + Capacity (not pos + 1)? The slot passes through Capacity
+     *   positions before returning to this index. The sentinel increments by
+     *   Capacity each wrap to distinguish generation N from generation N+1.
+     * ───────────────────────────────────────────────────────────────────────────
      */
     [[nodiscard]] bool try_dequeue(T*& out_item) noexcept {
-        std::size_t pos = tail_.load(std::memory_order_relaxed);
+        std::size_t pos = tail_.load(std::memory_order_relaxed); // hint only
 
         for (;;) {
             Slot<T>* slot = &slots_[pos & kMask];
+            // acquire: sync with producer's release that published slot->data
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
 
             if (__builtin_expect(diff == 0, 1)) {
+                // Slot is read-ready (seq == pos+1). Race all consumers via CAS on tail_.
+                // Relaxed CAS: ordering provided by acquire/release on slot->sequence.
                 if (tail_.compare_exchange_weak(pos, pos + 1,
                         std::memory_order_relaxed, std::memory_order_relaxed)) {
-                    cache::prefetch_read(&slots_[(pos + 1) & kMask]);
+                    cache::prefetch_read(&slots_[(pos + 1) & kMask]); // warm next slot
                     out_item = slot->data;
+                    // release: reset slot to write-ready for the next wrap-around generation
+                    // pos + kMask + 1 == pos + Capacity (kMask == Capacity - 1)
                     slot->sequence.store(pos + kMask + 1, std::memory_order_release);
                     return true;
                 }
+                // CAS lost; pause before retrying
                 cache::cpu_relax();
             } else if (diff < 0) {
+                // seq < pos+1: producer hasn't published this slot yet. Queue is empty.
                 if (derived().on_empty(out_item, pos)) {
                     pos = tail_.load(std::memory_order_relaxed);
                     continue;
                 }
                 return false;
             } else {
+                // diff > 0: another consumer already claimed pos. Reload and retry.
                 pos = tail_.load(std::memory_order_relaxed);
             }
         }
