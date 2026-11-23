@@ -122,6 +122,52 @@ namespace cache {
 #endif
     }
 
+    // ── Serialized Timing Boundaries (Intel IA-32/64 Benchmarking Standard) ──
+    // rdtsc_start(): LFENCE; RDTSC; LFENCE prevents prior/subsequent instruction leakage.
+    // rdtsc_end():   RDTSCP; LFENCE prevents prior instruction leakage past measurement.
+    [[nodiscard]] inline uint64_t rdtsc_start() noexcept {
+#if defined(MPMC_ARCH_X86)
+    #if defined(_MSC_VER)
+        _mm_lfence();
+        uint64_t val = __rdtsc();
+        _mm_lfence();
+        return val;
+    #else
+        _mm_lfence();
+        uint64_t val = static_cast<uint64_t>(__rdtsc());
+        _mm_lfence();
+        return val;
+    #endif
+#elif defined(MPMC_ARCH_ARM64)
+        uint64_t val;
+        __asm__ volatile("isb; mrs %0, cntvct_el0; isb" : "=r"(val) :: "memory");
+        return val;
+#else
+        return rdtsc();
+#endif
+    }
+
+    [[nodiscard]] inline uint64_t rdtsc_end() noexcept {
+#if defined(MPMC_ARCH_X86)
+        unsigned int aux;
+    #if defined(_MSC_VER)
+        uint64_t val = __rdtscp(&aux);
+        _mm_lfence();
+        return val;
+    #else
+        uint64_t val = static_cast<uint64_t>(__rdtscp(&aux));
+        _mm_lfence();
+        return val;
+    #endif
+#elif defined(MPMC_ARCH_ARM64)
+        uint64_t val;
+        __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(val) :: "memory");
+        return val;
+#else
+        return rdtsc();
+#endif
+    }
+
     // ── cpu_relax(): spin-loop pause hint ───────────────────────────────────
     //
     // x86-64 — PAUSE (REP NOP, opcode F3 90):

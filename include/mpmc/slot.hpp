@@ -40,19 +40,18 @@ namespace detail {
  *   2. Pointer mode (T*):
  *      For large payloads (>56 bytes), store a pointer T* (8 bytes) paired with an ObjectPool<T>.
  */
-template <typename T>
-struct alignas(kCacheLineSize) Slot {
-    static_assert(sizeof(T) <= (kCacheLineSize - sizeof(std::atomic<std::size_t>)),
-        "T must be <= 56 bytes to fit inside a single 64-byte cache-line slot. "
-        "For payloads > 56 bytes, instantiate RingBuffer<T*, Capacity> paired with ObjectPool<T>.");
+template <typename T, std::size_t Alignment = kCacheLineSize>
+struct alignas(Alignment) Slot {
+    static_assert(sizeof(T) <= (Alignment - sizeof(std::atomic<std::size_t>)),
+        "T must fit inside a single slot of the requested Alignment.");
 
     static constexpr std::size_t kPadSize =
-        kCacheLineSize - sizeof(std::atomic<std::size_t>) - sizeof(T);
+        Alignment - sizeof(std::atomic<std::size_t>) - sizeof(T);
 
     // 8 bytes: Ticket counter for Dmitry Vyukov sequence handshake
     std::atomic<std::size_t> sequence;
 
-    // Up to 56 bytes: Payload storage + trailing cache line fill
+    // Up to (Alignment - 8) bytes: Payload storage + trailing cache line fill
     detail::SlotPayload<T, kPadSize> payload;
 
     Slot() noexcept : sequence(0), payload{} {}
@@ -63,9 +62,11 @@ struct alignas(kCacheLineSize) Slot {
 
 // Strict compile-time validation for 64-bit architecture and cache alignment
 static_assert(sizeof(void*) == 8, "MPMC Queue requires a 64-bit architecture (sizeof(void*) == 8)");
-static_assert(sizeof(Slot<uint64_t>) == kCacheLineSize, "Slot<uint64_t> must be exactly 64 bytes (1 cache line)");
-static_assert(alignof(Slot<uint64_t>) == kCacheLineSize, "Slot<uint64_t> must be aligned to 64 bytes");
-static_assert(sizeof(Slot<void*>) == kCacheLineSize, "Slot<void*> must be exactly 64 bytes (1 cache line)");
-static_assert(alignof(Slot<void*>) == kCacheLineSize, "Slot<void*> must be aligned to 64 bytes");
+static_assert(sizeof(Slot<uint64_t, 64>) == 64, "Slot<uint64_t, 64> must be exactly 64 bytes (1 cache line)");
+static_assert(alignof(Slot<uint64_t, 64>) == 64, "Slot<uint64_t, 64> must be aligned to 64 bytes");
+static_assert(sizeof(Slot<uint64_t, 128>) == 128, "Slot<uint64_t, 128> must be exactly 128 bytes (2 cache lines)");
+static_assert(alignof(Slot<uint64_t, 128>) == 128, "Slot<uint64_t, 128> must be aligned to 128 bytes");
+static_assert(sizeof(Slot<void*>) == kCacheLineSize, "Slot<void*> must default to exactly 64 bytes (1 cache line)");
+static_assert(alignof(Slot<void*>) == kCacheLineSize, "Slot<void*> must default to 64-byte alignment");
 
 } // namespace mpmc

@@ -20,26 +20,29 @@
 namespace mpmc {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Platform-portable aligned allocation helpers (64-byte cache line alignment)
+// Platform-portable aligned allocation helpers
 // ─────────────────────────────────────────────────────────────────────────────
 namespace detail {
-    inline void* aligned_alloc_64(std::size_t bytes) noexcept {
+    inline void* aligned_alloc(std::size_t bytes, std::size_t alignment) noexcept {
 #if defined(_WIN32)
-        return _aligned_malloc(bytes, kCacheLineSize);
+        return _aligned_malloc(bytes, alignment);
 #else
         void* ptr = nullptr;
-        if (posix_memalign(&ptr, kCacheLineSize, bytes) != 0) return nullptr;
+        if (posix_memalign(&ptr, alignment, bytes) != 0) return nullptr;
         return ptr;
 #endif
     }
 
-    inline void aligned_free_64(void* ptr) noexcept {
+    inline void aligned_free(void* ptr) noexcept {
 #if defined(_WIN32)
         _aligned_free(ptr);
 #else
         free(ptr);
 #endif
     }
+
+    inline void* aligned_alloc_64(std::size_t bytes) noexcept { return aligned_alloc(bytes, kCacheLineSize); }
+    inline void aligned_free_64(void* ptr) noexcept { aligned_free(ptr); }
 } // namespace detail
 
 
@@ -50,23 +53,28 @@ namespace detail {
 //   bool on_full(size_t& pos)  — invoked when try_enqueue finds the buffer full
 //   bool on_empty(size_t& pos) — invoked when try_dequeue finds the buffer empty
 //
+// SlotAlignment:  Alignment & size of each slot (64B standard, 128B for prefetcher ablation)
+// IndexAlignment: Alignment & isolation of head_ and tail_ (64B standard, 128B for prefetcher ablation)
 // Zero virtual dispatch, zero vtable pointers.
 // ─────────────────────────────────────────────────────────────────────────────
-template <typename Derived, typename T, std::size_t Capacity>
+template <typename Derived, typename T, std::size_t Capacity,
+          std::size_t SlotAlignment = kCacheLineSize,
+          std::size_t IndexAlignment = kCacheLineSize>
 class RingBufferBase {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
     static_assert(Capacity >= 2,                    "Capacity must be at least 2");
 
 public:
     using value_type = T;
+    using SlotType   = Slot<T, SlotAlignment>;
 
     explicit RingBufferBase() {
-        slots_ = static_cast<Slot<T>*>(
-            detail::aligned_alloc_64(sizeof(Slot<T>) * Capacity));
+        slots_ = static_cast<SlotType*>(
+            detail::aligned_alloc(sizeof(SlotType) * Capacity, SlotAlignment));
         if (!slots_) throw std::bad_alloc();
 
         for (std::size_t i = 0; i < Capacity; ++i) {
-            new (&slots_[i]) Slot<T>();
+            new (&slots_[i]) SlotType();
             slots_[i].sequence.store(i, std::memory_order_relaxed);
         }
         head_.store(0, std::memory_order_relaxed);
@@ -75,8 +83,8 @@ public:
 
     ~RingBufferBase() noexcept {
         if (slots_) {
-            for (std::size_t i = 0; i < Capacity; ++i) slots_[i].~Slot<T>();
-            detail::aligned_free_64(slots_);
+            for (std::size_t i = 0; i < Capacity; ++i) slots_[i].~SlotType();
+            detail::aligned_free(slots_);
             slots_ = nullptr;
         }
     }
@@ -92,7 +100,7 @@ public:
         std::size_t pos = head_.load(std::memory_order_relaxed); // Hint only; CAS corrects stale reads
 
         for (;;) {
-            Slot<T>* slot = &slots_[pos & kMask];
+            SlotType* slot = &slots_[pos & kMask];
             // Synchronizes with consumer's release store below (seq == pos + Capacity)
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
@@ -126,7 +134,7 @@ public:
         std::size_t pos = head_.load(std::memory_order_relaxed);
 
         for (;;) {
-            Slot<T>* slot = &slots_[pos & kMask];
+            SlotType* slot = &slots_[pos & kMask];
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
 
@@ -158,7 +166,7 @@ public:
         std::size_t pos = tail_.load(std::memory_order_relaxed); // Hint only; CAS corrects stale reads
 
         for (;;) {
-            Slot<T>* slot = &slots_[pos & kMask];
+            SlotType* slot = &slots_[pos & kMask];
             // Synchronizes with producer's release store above (seq == pos + 1)
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
@@ -191,7 +199,7 @@ public:
         std::size_t pos = tail_.load(std::memory_order_relaxed);
 
         for (;;) {
-            Slot<T>* slot = &slots_[pos & kMask];
+            SlotType* slot = &slots_[pos & kMask];
             std::size_t seq = slot->sequence.load(std::memory_order_acquire);
             intptr_t diff   = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
 
@@ -236,7 +244,7 @@ public:
             if (head_.compare_exchange_weak(pos, pos + to_claim,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SlotType* slot = &slots_[(pos + i) & kMask];
                     SpinWait bk;
                     while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
                         bk.spin();
@@ -269,7 +277,7 @@ public:
             if (head_.compare_exchange_weak(pos, pos + to_claim,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SlotType* slot = &slots_[(pos + i) & kMask];
                     SpinWait bk;
                     while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
                         bk.spin();
@@ -301,7 +309,7 @@ public:
             if (tail_.compare_exchange_weak(pos, pos + to_claim,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SlotType* slot = &slots_[(pos + i) & kMask];
                     SpinWait bk;
                     while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
                         bk.spin();
@@ -333,7 +341,7 @@ public:
             if (tail_.compare_exchange_weak(pos, pos + to_claim,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
                 for (std::size_t i = 0; i < to_claim; ++i) {
-                    Slot<T>* slot = &slots_[(pos + i) & kMask];
+                    SlotType* slot = &slots_[(pos + i) & kMask];
                     SpinWait bk;
                     while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
                         bk.spin();
@@ -375,7 +383,7 @@ public:
 protected:
     std::atomic<std::size_t>& head_ref() noexcept { return head_; }
     std::atomic<std::size_t>& tail_ref() noexcept { return tail_; }
-    Slot<T>* slots_ptr() noexcept { return slots_; }
+    SlotType* slots_ptr() noexcept { return slots_; }
 
     static constexpr std::size_t kMask = Capacity - 1;
 
@@ -383,16 +391,16 @@ private:
     Derived& derived() noexcept { return *static_cast<Derived*>(this); }
 
     // CL 0: slots_ pointer (read-mostly)
-    alignas(kCacheLineSize) Slot<T>* slots_{nullptr};
+    alignas(IndexAlignment) SlotType* slots_{nullptr};
 
     // CL 1: head_ index (producers exclusive)
-    alignas(kCacheLineSize) std::atomic<std::size_t> head_{0};
+    alignas(IndexAlignment) std::atomic<std::size_t> head_{0};
 
     // CL 2: tail_ index (consumers exclusive)
-    alignas(kCacheLineSize) std::atomic<std::size_t> tail_{0};
+    alignas(IndexAlignment) std::atomic<std::size_t> tail_{0};
 
     // Trailing padding to isolate tail_'s cache line
-    char _pad[kCacheLineSize - sizeof(std::atomic<std::size_t>)]{};
+    char _pad[IndexAlignment - sizeof(std::atomic<std::size_t>)]{};
 };
 
 
@@ -402,11 +410,13 @@ private:
 // on_full  → returns false immediately (backpressure signal)
 // on_empty → returns false immediately
 // ─────────────────────────────────────────────────────────────────────────────
-template <typename T = void*, std::size_t Capacity = 1024>
-class RingBuffer : public RingBufferBase<RingBuffer<T, Capacity>, T, Capacity> {
-    friend class RingBufferBase<RingBuffer<T, Capacity>, T, Capacity>;
+template <typename T = void*, std::size_t Capacity = 1024,
+          std::size_t SlotAlignment = kCacheLineSize,
+          std::size_t IndexAlignment = kCacheLineSize>
+class RingBuffer : public RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment> {
+    friend class RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>;
 public:
-    using RingBufferBase<RingBuffer<T, Capacity>, T, Capacity>::RingBufferBase;
+    using RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>::RingBufferBase;
 
 private:
     [[nodiscard]] bool on_full(std::size_t&) noexcept { return false; }
@@ -420,12 +430,14 @@ private:
 // on_full  → spins with cpu_relax() until space is available
 // on_empty → spins with cpu_relax() until an item is available
 // ─────────────────────────────────────────────────────────────────────────────
-template <typename T = void*, std::size_t Capacity = 1024>
+template <typename T = void*, std::size_t Capacity = 1024,
+          std::size_t SlotAlignment = kCacheLineSize,
+          std::size_t IndexAlignment = kCacheLineSize>
 class SpinningRingBuffer
-    : public RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity> {
-    friend class RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity>;
+    : public RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment> {
+    friend class RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>;
 public:
-    using RingBufferBase<SpinningRingBuffer<T, Capacity>, T, Capacity>::RingBufferBase;
+    using RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>::RingBufferBase;
 
 private:
     [[nodiscard]] bool on_full(std::size_t& pos) noexcept {

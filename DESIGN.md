@@ -96,21 +96,31 @@ Modern x86-64 processors (Intel Core / Xeon) feature two levels of hardware pref
 
 If `head_` and `tail_` are separated by 64 bytes of padding, they reside on separate 64-byte lines, which prevents standard MESI false sharing. However, if they fall within the same 128-byte aligned sector, the L2 spatial prefetcher may speculatively request the adjacent line, inducing cross-core coherency traffic.
 
-* **Design Decision**: `head_` and `tail_` are separated by a dedicated 64-byte cache line. An ablation comparing 64-byte vs 128-byte separation is documented in the Ablation section.
+* **Empirical Ablation Finding**:
+  * Config 1 (64B Slot / 64B Head-Tail): **45.1 ns** ($p50$)
+  * Config 2 (64B Slot / 128B Head-Tail): **45.1 ns** ($p50$)
+  * Config 3 (128B Slot / 128B Head-Tail): **50.3 ns** ($p50$)
+* **Conclusion**: Separating `head_` and `tail_` to 128B yields a **null result**—prefetcher interference between indices is negligible once they are isolated to distinct 64B lines. Padded 128B slots slightly increase latency (+5.2 ns) due to greater L1/L2 cache footprint.
 
 ### 2. User-Space Backoff: Pure Busy-Wait vs. `_mm_pause`
 
 The backoff loop in `SpinningRingBuffer` calls `cache::cpu_relax()` on each failed attempt. On x86-64, this emits `_mm_pause()` (`rep nop`).
 
-* **Empirical Cost**: On Intel Raptor Lake (14700HX), `_mm_pause()` introduces a pipeline delay of **~42.5 ns (98 TSC ticks)**.
-* **Latency Trade-off**:
-  * In a dedicated 1P:1C pipeline where a consumer waits for a producer, inserting a 42.5 ns pause can add up to 42 ns of jitter if the producer publishes right after the pause begins.
-  * Conversely, a pure busy-poll loop (`while (...) {}`) burns 100% of the execution pipeline, starves hyper-threading sibling threads, and triggers thermal throttling under prolonged idle periods.
-* **Guideline**: In ultra-low latency scenarios with dedicated non-hyperthreaded cores, pure busy-polling minimizes tail handoff latency. When sharing cores or in multi-tenant environments, `_mm_pause()` is essential.
+* **Empirical Cost & Measured Delta**:
+  * On Intel Raptor Lake (14700HX), `_mm_pause()` introduces a pipeline delay of **~42.5 ns (98 TSC ticks)**.
+  * In our 10-run ablation on physical cores, pure busy-polling achieves **45.1 ns** ($p50$) / **53.0 ns** ($p99$), whereas `_mm_pause()` achieves **50.3 ns** ($p50$) / **59.0 ns** ($p99$).
+* **Trade-off Analysis**:
+  * In a dedicated 1P:1C pipeline where a consumer waits for a producer, inserting a 42.5 ns pause adds ~5 ns to median handoff latency and up to 40 ns of jitter if the producer publishes right after the pause begins.
+  * Conversely, a pure busy-poll loop burns 100% of the core's execution pipeline, starves hyper-threading sibling threads (SMT), and increases core power.
+* **Guideline**: In ultra-low latency scenarios with dedicated non-hyperthreaded cores (`isolcpus`), pure busy-polling minimizes tail handoff latency. When sharing cores or in multi-tenant environments, `_mm_pause()` is essential.
 
 ### 3. Contended Multi-Producer Bottlenecks (Single-CAS vs Token Queues)
 
-At 4P:4C, streaming throughput is **11.40M ops/s**, compared to **20.09M ops/s** for `moodycamel::ConcurrentQueue`.
+At 4P:4C, streaming throughput is **11.53M ops/s**, compared to **19.28M ops/s** for `moodycamel::ConcurrentQueue`.
+* **Empirical Contention Telemetry**:
+  * 1P:1C: 60.49M ops/s, 0.00% CAS collision rate (0 fails)
+  * 2P:2C: 19.63M ops/s, 40.00% CAS collision rate (1,333,470 fails)
+  * 4P:4C: 11.33M ops/s, 63.39% CAS collision rate (3,463,038 fails)
 * **Explanation**: All 4 producers contend on the single `head_` atomic counter via `LOCK CMPXCHG`. The cache line containing `head_` must bounce across the L3 interconnect between all 4 producer cores for every claim.
 * **Comparison with Moodycamel**: Moodycamel distributes producers across thread-local block queues, eliminating shared-counter contention. The architectural trade-off is that Moodycamel sacrifices strict global FIFO ordering across threads and requires dynamic chunk allocations.
 
