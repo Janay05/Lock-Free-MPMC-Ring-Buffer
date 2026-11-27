@@ -34,4 +34,21 @@ private:
     uint32_t count_{0};
 };
 
+// Truncated exponential backoff after a lost CAS: 1, 2, 4, ... pauses, capped at
+// MaxPauses. MaxPauses = 1 is a single pause per failure. State is local to one
+// queue call, so an uncontended operation pays nothing.
+template <uint32_t MaxPauses>
+class CasBackoff {
+    static_assert(MaxPauses >= 1, "MaxPauses must be at least 1");
+
+public:
+    inline void pause() noexcept {
+        for (uint32_t i = 0; i < next_; ++i) cache::cpu_relax();
+        if (next_ < MaxPauses) next_ *= 2;
+    }
+
+private:
+    uint32_t next_{1};
+};
+
 } // namespace mpmc

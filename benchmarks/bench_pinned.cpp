@@ -3,6 +3,7 @@
 #include "mpmc/histogram.hpp"
 #include "mpmc/stats.hpp"
 #include "mpmc/cache.hpp"
+#include "bench_util.hpp"
 
 #include <chrono>
 #include <cassert>
@@ -15,9 +16,6 @@
 #include <algorithm>
 
 using namespace mpmc;
-
-// Calibrated Invariant TSC conversion for Intel Core i7-14700HX (2.304011 GHz nominal reference)
-inline constexpr double kNsPerTscTick = 0.434026;
 
 struct LatencyMessage {
     uint64_t send_tsc{0};
@@ -67,16 +65,16 @@ AggregatedStats aggregate_runs(std::vector<PercentileStats>& runs) {
 
 void print_aggregated(const std::string& label, const AggregatedStats& s) {
     std::cout << "  " << std::left << std::setw(30) << label 
-              << "p50: " << std::fixed << std::setprecision(1) << s.p50_med << "t (" << s.p50_med * kNsPerTscTick << "ns) [" 
+              << "p50: " << std::fixed << std::setprecision(1) << s.p50_med << "t (" << s.p50_med * bench::ns_per_tick() << "ns) [" 
               << s.p50_min << "-" << s.p50_max << "t] | "
-              << "p90: " << s.p90_med << "t (" << s.p90_med * kNsPerTscTick << "ns) | "
-              << "p99: " << s.p99_med << "t (" << s.p99_med * kNsPerTscTick << "ns) | "
-              << "p99.9: " << s.p999_med << "t (" << s.p999_med * kNsPerTscTick << "ns) | "
-              << "Worst Max: " << s.worst_max << "t (" << s.worst_max * kNsPerTscTick / 1000.0 << "µs)\n";
+              << "p90: " << s.p90_med << "t (" << s.p90_med * bench::ns_per_tick() << "ns) | "
+              << "p99: " << s.p99_med << "t (" << s.p99_med * bench::ns_per_tick() << "ns) | "
+              << "p99.9: " << s.p999_med << "t (" << s.p999_med * bench::ns_per_tick() << "ns) | "
+              << "Worst Max: " << s.worst_max << "t (" << s.worst_max * bench::ns_per_tick() / 1000.0 << "µs)\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Benchmark 1: Paced True One-Way Latency (Producer Core 0 -> Consumer Core 1)
+// Benchmark 1: Paced True One-Way Latency (Producer physical core 0 -> 1)
 // ─────────────────────────────────────────────────────────────────────────────
 template <bool UsePause, typename QueueType>
 PercentileStats run_one_way_latency_pass(QueueType& queue, size_t warmup, size_t samples, std::atomic<size_t>& negative_tsc_count) {
@@ -85,7 +83,7 @@ PercentileStats run_one_way_latency_pass(QueueType& queue, size_t warmup, size_t
     std::atomic<bool> stop_consumer{false};
 
     std::thread consumer([&]() {
-        affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         affinity::set_current_thread_priority_critical();
 
         while (!stop_consumer.load(std::memory_order_relaxed)) {
@@ -107,7 +105,7 @@ PercentileStats run_one_way_latency_pass(QueueType& queue, size_t warmup, size_t
         }
     });
 
-    affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     affinity::set_current_thread_priority_critical();
 
     size_t total = warmup + samples;
@@ -149,7 +147,7 @@ PercentileStats run_one_way_latency_pass(QueueType& queue, size_t warmup, size_t
 
 void benchmark_one_way_latency_suite() {
     std::cout << "\n========================================================================\n";
-    std::cout << " [BENCHMARK 1] Paced True One-Way Latency Across Physical Cores (Core 0 -> Core 1)\n";
+    std::cout << " [BENCHMARK 1] Paced True One-Way Latency Across Physical Cores (physical core 0 -> 1)\n";
     std::cout << "               Measurement: send_tsc stamped immediately before try_enqueue\n";
     std::cout << "                            recv_tsc stamped immediately upon try_dequeue\n";
     std::cout << "               Queue depth: ~0 (paced producer waits for consumer drain ack)\n";
@@ -180,14 +178,12 @@ void benchmark_one_way_latency_suite() {
 
     std::cout << "\n--- Cross-Core TSC Monotonicity & Invariant Synchronization ---\n";
     std::cout << "  Negative TSC Latency Anomalies: " << negative_tsc_count.load() 
-              << " / " << (RUNS * 2 * SAMPLES) << " observations (TSC synchronized across P-cores)\n\n";
+              << " / " << (RUNS * 2 * SAMPLES) << " observations\n\n";
 
     std::cout << "--- 10-Run Aggregated True One-Way Handoff Latency ---\n";
     print_aggregated("Mode A (Pure Busy-Poll):", busy_agg);
     print_aggregated("Mode B (_mm_pause Backoff):", pause_agg);
 
-    std::cout << "\n  [Observation]: Pure busy-polling delivers tighter latency because it eliminates the\n"
-              << "                 ~42.5 ns (98 tick) pipeline stall incurred when a producer arrives during _mm_pause().\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,24 +231,20 @@ void benchmark_padding_ablations() {
     print_aggregated("Config 2 (64B Slot / 128B HT):", c2_agg);
     print_aggregated("Config 3 (128B Slot / 128B HT):", c3_agg);
 
-    std::cout << "\n  [Finding]: Separating head_ and tail_ to 128B produces comparable p50 latency (" 
-              << std::fixed << std::setprecision(1) << c1_agg.p50_med * kNsPerTscTick << "ns vs " 
-              << c2_agg.p50_med * kNsPerTscTick << "ns).\n"
-              << "             Reporting null result: Intel L2 spatial prefetcher interference between head_\n"
-              << "             and tail_ is negligible when both lines are already separated by 64 bytes.\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Benchmark 3: Empirical Contention Scaling Across Physical P-Cores
 // ─────────────────────────────────────────────────────────────────────────────
-void run_contention_topology(size_t p_count, size_t c_count, size_t total_items) {
+double run_contention_topology(size_t p_count, size_t c_count, size_t total_items,
+                               QueueStats& producer_totals, QueueStats& consumer_totals) {
     size_t items_per_p = total_items / p_count;
     RingBuffer<uint64_t, 4096> rb;
 
     std::vector<QueueStats> p_stats(p_count);
     std::vector<QueueStats> c_stats(c_count);
 
-    std::atomic<bool> start_gate{false};
+    bench::StartGate gate(p_count + c_count);
     std::atomic<size_t> total_consumed{0};
     std::atomic<uint64_t> total_sum{0};
 
@@ -260,10 +252,10 @@ void run_contention_topology(size_t p_count, size_t c_count, size_t total_items)
     std::vector<std::thread> consumers;
     for (size_t c = 0; c < c_count; ++c) {
         consumers.emplace_back([&, c]() {
-            affinity::pin_current_thread_to_core(static_cast<uint32_t>(p_count + c));
+            bench::pin(p_count + c);
             affinity::set_current_thread_priority_critical();
 
-            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            gate.arrive();
             uint64_t local_sum = 0;
             while (total_consumed.load(std::memory_order_relaxed) < total_items) {
                 uint64_t out = 0;
@@ -282,10 +274,10 @@ void run_contention_topology(size_t p_count, size_t c_count, size_t total_items)
     std::vector<std::thread> producers;
     for (size_t p = 0; p < p_count; ++p) {
         producers.emplace_back([&, p]() {
-            affinity::pin_current_thread_to_core(static_cast<uint32_t>(p));
+            bench::pin(p);
             affinity::set_current_thread_priority_critical();
 
-            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            gate.arrive();
             size_t base = p * items_per_p;
             for (size_t i = 0; i < items_per_p; ++i) {
                 while (!rb.try_enqueue(base + i + 1, p_stats[p])) {
@@ -295,27 +287,17 @@ void run_contention_topology(size_t p_count, size_t c_count, size_t total_items)
         });
     }
 
-    auto t0 = std::chrono::steady_clock::now();
-    start_gate.store(true, std::memory_order_release);
-
     for (auto& t : producers) t.join();
     for (auto& t : consumers) t.join();
+    const double elapsed_sec = gate.seconds_since_open();
 
-    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-
-    QueueStats agg_p = aggregate_stats(p_stats);
-    QueueStats agg_c = aggregate_stats(c_stats);
-
-    double ops_sec = (static_cast<double>(total_items) / elapsed_ns) * 1e9;
-    std::cout << "  - " << p_count << "P:" << c_count << "C Topology (" 
-              << (p_count + c_count) << " physical P-cores):\n"
-              << "      Throughput:         " << std::fixed << std::setprecision(2) << ops_sec / 1e6 << " M ops/sec\n"
-              << "      Latency per Item:   " << std::fixed << std::setprecision(1) << static_cast<double>(elapsed_ns) / total_items << " ns/op\n"
-              << "      Producer CAS Fails: " << agg_p.enqueue_cas_fail << " (" 
-              << std::fixed << std::setprecision(2) << agg_p.enqueue_contention_ratio() << "% collision rate)\n"
-              << "      Consumer CAS Fails: " << agg_c.dequeue_cas_fail << " (" 
-              << std::fixed << std::setprecision(2) << agg_c.dequeue_contention_ratio() << "% collision rate)\n";
+    const QueueStats agg_p = aggregate_stats(p_stats);
+    const QueueStats agg_c = aggregate_stats(c_stats);
+    producer_totals.enqueue_success += agg_p.enqueue_success;
+    producer_totals.enqueue_cas_fail += agg_p.enqueue_cas_fail;
+    consumer_totals.dequeue_success += agg_c.dequeue_success;
+    consumer_totals.dequeue_cas_fail += agg_c.dequeue_cas_fail;
+    return (static_cast<double>(total_items) / elapsed_sec) / 1e6;
 }
 
 void benchmark_contention_scaling_suite() {
@@ -326,9 +308,13 @@ void benchmark_contention_scaling_suite() {
     std::cout << "========================================================================\n";
 
     constexpr size_t TOTAL = 2'000'000;
-    run_contention_topology(1, 1, TOTAL);
-    run_contention_topology(2, 2, TOTAL);
-    run_contention_topology(4, 4, TOTAL);
+    for (size_t n : {size_t{1}, size_t{2}, size_t{4}}) {
+        QueueStats p, c;
+        const bench::Summary mops = bench::repeat([&] { return run_contention_topology(n, n, TOTAL, p, c); });
+        std::cout << "  - " << n << "P:" << n << "C  M ops/s " << bench::format(mops) << std::fixed
+                  << std::setprecision(1) << " | failed CAS: producer " << p.enqueue_contention_ratio()
+                  << "%, consumer " << c.dequeue_contention_ratio() << "%\n";
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,18 +326,18 @@ void benchmark_bulk_scaling_suite() {
     std::cout << "========================================================================\n";
 
     constexpr size_t TOTAL = 5'000'000;
-    auto test_batch = [&](size_t batch_size) {
+    auto run_batch = [&](size_t batch_size) {
         RingBuffer<uint64_t, 4096> rb;
         std::vector<uint64_t> send_data(TOTAL);
         for (size_t i = 0; i < TOTAL; ++i) send_data[i] = i + 1;
 
-        std::atomic<bool> start_gate{false};
+        bench::StartGate gate(2);
         uint64_t consumer_sum = 0;
 
         std::thread consumer([&]() {
-            affinity::pin_current_thread_to_core(1);
+            bench::pin(1);
             affinity::set_current_thread_priority_critical();
-            while (!start_gate.load(std::memory_order_relaxed)) cache::cpu_relax();
+            gate.arrive();
 
             size_t received = 0;
             std::vector<uint64_t> batch(batch_size, 0);
@@ -366,11 +352,10 @@ void benchmark_bulk_scaling_suite() {
             }
         });
 
-        affinity::pin_current_thread_to_core(0);
+        bench::pin(0);
         affinity::set_current_thread_priority_critical();
 
-        auto t0 = std::chrono::steady_clock::now();
-        start_gate.store(true, std::memory_order_release);
+        gate.arrive();
 
         size_t sent = 0;
         while (sent < TOTAL) {
@@ -381,33 +366,48 @@ void benchmark_bulk_scaling_suite() {
         }
 
         consumer.join();
-        auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-
-        double ops_sec = (static_cast<double>(TOTAL) / elapsed_ns) * 1e9;
-        std::cout << "  - Batch = " << std::left << std::setw(4) << batch_size 
-                  << " -> Throughput: " << std::fixed << std::setprecision(2) << ops_sec / 1e6 << " M ops/sec ("
-                  << std::setprecision(2) << static_cast<double>(elapsed_ns) / TOTAL << " ns/item)\n";
+        return (static_cast<double>(TOTAL) / gate.seconds_since_open()) / 1e6;
     };
 
-    test_batch(1);
-    test_batch(8);
-    test_batch(16);
-    test_batch(32);
+    for (size_t batch : {size_t{1}, size_t{8}, size_t{16}, size_t{32}}) {
+        std::cout << "  - batch " << batch << "  M items/s "
+                  << bench::format(bench::repeat([&] { return run_batch(batch); })) << "\n";
+    }
+}
+
+// Benchmark 5: cost of the spin-wait primitives
+template <typename Fn>
+void measure_primitive(const char* name, Fn&& fn) {
+    constexpr size_t SAMPLES = 500'000;
+    LatencyHistogram hist;
+    for (size_t i = 0; i < SAMPLES; ++i) {
+        const uint64_t t0 = cache::rdtsc_start();
+        fn();
+        hist.record(cache::rdtsc_end() - t0);
+    }
+    std::cout << "  - " << name << std::fixed << std::setprecision(1)
+              << " p50 " << hist.percentile(50.0) * bench::ns_per_tick() << " ns, p99 "
+              << hist.percentile(99.0) * bench::ns_per_tick() << " ns, max "
+              << hist.max() * bench::ns_per_tick() / 1000.0 << " us\n";
+}
+
+void benchmark_primitives() {
+    std::cout << "\n [BENCHMARK 5] Spin-wait primitives (includes timer overhead, see empty row)\n";
+    bench::pin(0);
+    measure_primitive("empty             ", [] {});
+    measure_primitive("cpu_relax (pause) ", [] { cache::cpu_relax(); });
+    measure_primitive("this_thread::yield", [] { std::this_thread::yield(); });
 }
 
 int main() {
-    std::cout << "========================================================================\n";
-    std::cout << "   Lock-Free MPMC Ring Buffer Hardware-Pinned Benchmarks Suite\n";
-    std::cout << "   Host: Intel Core i7-14700HX (8 P-Cores, 12 E-Cores)\n";
-    std::cout << "   Invariant TSC Reference: 2.304011 GHz (0.434026 ns per tick)\n";
-    std::cout << "   Thread Scheduling: THREAD_PRIORITY_TIME_CRITICAL on Physical P-Cores\n";
-    std::cout << "========================================================================\n";
+    std::cout << "MPMC ring buffer pinned benchmarks\n";
+    bench::print_host();
 
     benchmark_one_way_latency_suite();
     benchmark_padding_ablations();
     benchmark_contention_scaling_suite();
     benchmark_bulk_scaling_suite();
+    benchmark_primitives();
 
     std::cout << "\n========================================================================\n";
     std::cout << " [ALL BENCHMARKS AND ABLATIONS COMPLETED SUCCESSFULLY]\n";

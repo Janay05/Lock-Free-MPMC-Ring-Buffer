@@ -13,16 +13,16 @@
 namespace mpmc {
 
 /**
- * Lock-Free Slab Object Pool
+ * Slab Object Pool (no mutexes)
  *
  * Pre-allocates exactly `Capacity` objects of type `T` at construction time
  * and manages them via an internal MPMC ring buffer of free pointers.
  *
  * Hot-path operations:
- *   acquire() → one lock-free try_dequeue from free_list_
- *   release() → one lock-free try_enqueue  into free_list_
+ *   acquire() → one try_dequeue from free_list_
+ *   release() → one try_enqueue  into free_list_
  *
- * Zero dynamic allocation after construction. Zero locks. Zero syscalls.
+ * Zero dynamic allocation after construction. No mutexes, no syscalls.
  *
  * Memory layout:
  *   storage_[]   : alignas(64) flat array of T — contiguous, cache-friendly
@@ -95,7 +95,7 @@ public:
     /**
      * Acquire a pre-allocated object from the pool.
      *
-     * Lock-free: internally calls try_dequeue on the free list ring buffer.
+     * No locks: internally calls try_dequeue on the free list ring buffer.
      * Returns nullptr if the pool is exhausted (all Capacity objects in use).
      *
      * Hot path cost: 1 atomic load (acquire) + 1 CAS + 1 atomic store (release)
@@ -110,7 +110,7 @@ public:
     /**
      * Release an object back to the pool.
      *
-     * Lock-free: internally calls try_enqueue on the free list ring buffer.
+     * No locks: internally calls try_enqueue on the free list ring buffer.
      * The caller MUST NOT access `ptr` after calling release().
      *
      * Precondition: ptr must have been obtained from this pool's acquire().
@@ -145,7 +145,7 @@ private:
     // Cache-line aligned to prevent the first object straddling a cache boundary.
     alignas(kCacheLineSize) T* storage_{nullptr};
 
-    // Lock-free ring buffer acting as the free-slot list.
+    // Ring buffer acting as the free-slot list.
     // Holds T* pointers to slots within storage_[].
     // At full capacity: Capacity pointers in queue → all slots free.
     // At zero:          0 pointers in queue       → all slots in use.

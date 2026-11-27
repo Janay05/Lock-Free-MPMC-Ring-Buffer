@@ -1,0 +1,23 @@
+CAS backoff sweep
+Physical cores available (logical CPU ids): 0 2 4 6 8 10 12 14
+Measured TSC period: 0.434028 ns/tick (2.3040 GHz)
+
+M items/s, median [min-max] of 11 runs
+  1P:1C  max pauses    1  39.0 [29.7-46.8]
+  1P:1C  max pauses    4  37.6 [28.3-39.3]
+  1P:1C  max pauses   16  36.7 [29.8-38.2]
+  1P:1C  max pauses   64  37.4 [27.3-40.3]
+  1P:1C  max pauses  256  37.0 [28.9-39.2]
+  1P:1C  max pauses 1024  36.4 [28.2-38.1]
+  2P:2C  max pauses    1  9.0 [8.6-10.6]
+  2P:2C  max pauses    4  8.9 [8.6-10.5]
+  2P:2C  max pauses   16  9.1 [8.7-10.8]
+  2P:2C  max pauses   64  8.9 [8.7-10.4]
+  2P:2C  max pauses  256  8.9 [8.7-10.6]
+  2P:2C  max pauses 1024  9.0 [8.5-10.6]
+  4P:4C  max pauses    1  7.1 [6.9-7.6]
+  4P:4C  max pauses    4  7.9 [7.5-8.3]
+  4P:4C  max pauses   16  8.4 [8.1-8.8]
+  4P:4C  max pauses   64  8.6 [8.4-9.5]
+  4P:4C  max pauses  256  8.7 [8.5-9.1]
+  4P:4C  max pauses 1024  8.7 [8.4-9.0]

@@ -41,6 +41,12 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_libraries(bench_pinned PRIVATE -pthread)
 endif()
 
+add_executable(bench_backoff benchmarks/bench_backoff.cpp)
+target_link_libraries(bench_backoff PRIVATE mpmc_queue)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_libraries(bench_backoff PRIVATE -pthread)
+endif()
+
 # ── External Baselines for Comparative Benchmarking ──────────────────────────
 include(FetchContent)
 
@@ -48,21 +54,21 @@ include(FetchContent)
 FetchContent_Declare(
     rigtorp_mpmc
     GIT_REPOSITORY https://github.com/rigtorp/MPMCQueue.git
-    GIT_TAG        master
+    GIT_TAG        62f249d170330c7f66557c4b4539fb98c78ad1ab
 )
 
 # 2. rigtorp::SPSCQueue (Industry reference lock-free single-producer single-consumer)
 FetchContent_Declare(
     rigtorp_spsc
     GIT_REPOSITORY https://github.com/rigtorp/SPSCQueue.git
-    GIT_TAG        master
+    GIT_TAG        cd49c7cb430fbb298d981c1793c0d46348c4c9d5
 )
 
 # 3. moodycamel::ConcurrentQueue (Lock-free unbounded block-based queue)
 FetchContent_Declare(
     moodycamel_cq
     GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-    GIT_TAG        master
+    GIT_TAG        36c5755dc0789e5bcddbbb9a201d3af2bbf3024c
 )
 
 FetchContent_MakeAvailable(rigtorp_mpmc rigtorp_spsc moodycamel_cq)

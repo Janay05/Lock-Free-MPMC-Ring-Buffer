@@ -2,6 +2,7 @@
 #include "mpmc/affinity.hpp"
 #include "mpmc/histogram.hpp"
 #include "mpmc/cache.hpp"
+#include "bench_util.hpp"
 
 #include <rigtorp/MPMCQueue.h>
 #include <rigtorp/SPSCQueue.h>
@@ -18,8 +19,6 @@
 #include <condition_variable>
 #include <algorithm>
 #include <tuple>
-
-inline constexpr double kNsPerTscTick = 0.434026; // Calibrated 2.304011 GHz nominal TSC reference
 
 struct LatencyMessage {
     uint64_t send_tsc{0};
@@ -130,14 +129,14 @@ struct FullQueueResult {
     std::string name;
     std::string pattern;
     AggregatedLatency latency;
-    double spsc_pipelined_mops{0.0};
-    double mpmc_2p2c_mops{0.0};
-    double mpmc_4p4c_mops{0.0};
-    double bulk_batch32_mops{0.0};
+    bench::Summary spsc_pipelined_mops{};
+    bench::Summary mpmc_2p2c_mops{};
+    bench::Summary mpmc_4p4c_mops{};
+    bench::Summary bulk_batch32_mops{};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Paced True One-Way Latency Passes (Core 0 -> Core 1)
+// 1. Paced True One-Way Latency Passes (physical core 0 -> 1)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Standard queues (mpmc::RingBuffer, rigtorp::MPMCQueue, MutexDequeQueue)
@@ -148,7 +147,7 @@ LatencyStats measure_one_way_pass(QueueType& q, size_t warmup, size_t samples) {
     std::atomic<bool> stop_consumer{false};
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
 
         while (!stop_consumer.load(std::memory_order_relaxed)) {
@@ -172,7 +171,7 @@ LatencyStats measure_one_way_pass(QueueType& q, size_t warmup, size_t samples) {
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
 
     size_t total = warmup + samples;
@@ -216,7 +215,7 @@ LatencyStats measure_rigtorp_spsc_pass(rigtorp::SPSCQueue<LatencyMessage>& q, si
     std::atomic<bool> stop_consumer{false};
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
 
         while (!stop_consumer.load(std::memory_order_relaxed)) {
@@ -235,7 +234,7 @@ LatencyStats measure_rigtorp_spsc_pass(rigtorp::SPSCQueue<LatencyMessage>& q, si
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
 
     size_t total = warmup + samples;
@@ -275,7 +274,7 @@ LatencyStats measure_moodycamel_pass(moodycamel::ConcurrentQueue<LatencyMessage>
     std::atomic<bool> stop_consumer{false};
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
         moodycamel::ConsumerToken ctok(q);
 
@@ -293,7 +292,7 @@ LatencyStats measure_moodycamel_pass(moodycamel::ConcurrentQueue<LatencyMessage>
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
     moodycamel::ProducerToken ptok(q);
 
@@ -328,19 +327,19 @@ LatencyStats measure_moodycamel_pass(moodycamel::ConcurrentQueue<LatencyMessage>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Streaming Pipelined Throughput (1P:1C, Core 0 -> Core 1)
+// 2. Streaming Pipelined Throughput (1P:1C, physical core 0 -> 1)
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename QueueType>
 double bench_spsc_pipelined_throughput(QueueType& q) {
     constexpr size_t TOTAL = 2'000'000;
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(2);
     uint64_t consumer_sum = 0;
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
 
-        while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+        gate.arrive();
 
         size_t received = 0;
         while (received < TOTAL) {
@@ -372,11 +371,10 @@ double bench_spsc_pipelined_throughput(QueueType& q) {
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
+    gate.arrive();
 
     for (size_t i = 0; i < TOTAL; ++i) {
         if constexpr (requires { q.try_enqueue(static_cast<uint64_t>(i + 1)); }) {
@@ -387,22 +385,21 @@ double bench_spsc_pipelined_throughput(QueueType& q) {
     }
 
     consumer.join();
-    auto end_time = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL) / elapsed_sec) / 1e6;
 }
 
 double bench_moodycamel_pipelined_throughput(moodycamel::ConcurrentQueue<uint64_t>& q) {
     constexpr size_t TOTAL = 2'000'000;
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(2);
     uint64_t consumer_sum = 0;
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
         moodycamel::ConsumerToken ctok(q);
 
-        while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+        gate.arrive();
 
         size_t received = 0;
         while (received < TOTAL) {
@@ -416,20 +413,18 @@ double bench_moodycamel_pipelined_throughput(moodycamel::ConcurrentQueue<uint64_
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
     moodycamel::ProducerToken ptok(q);
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
+    gate.arrive();
 
     for (size_t i = 0; i < TOTAL; ++i) {
         q.enqueue(ptok, static_cast<uint64_t>(i + 1));
     }
 
     consumer.join();
-    auto end_time = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL) / elapsed_sec) / 1e6;
 }
 
@@ -438,10 +433,10 @@ double bench_moodycamel_pipelined_throughput(moodycamel::ConcurrentQueue<uint64_
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename QueueType>
 double bench_topology_throughput(QueueType& q, size_t producers, size_t consumers) {
-    constexpr size_t TOTAL_OPS = 200'000;
+    constexpr size_t TOTAL_OPS = 2'000'000;
     const size_t ops_per_producer = TOTAL_OPS / producers;
 
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(producers + consumers);
     std::atomic<size_t> consumed{0};
 
     std::vector<std::thread> threads;
@@ -449,10 +444,10 @@ double bench_topology_throughput(QueueType& q, size_t producers, size_t consumer
 
     for (size_t i = 0; i < consumers; ++i) {
         threads.emplace_back([&, i]() {
-            mpmc::affinity::pin_current_thread_to_core(static_cast<uint32_t>(producers + i));
+            bench::pin(producers + i);
             mpmc::affinity::set_current_thread_priority_critical();
 
-            while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+            gate.arrive();
 
             while (consumed.load(std::memory_order_relaxed) < TOTAL_OPS) {
                 uint64_t item = 0;
@@ -469,10 +464,10 @@ double bench_topology_throughput(QueueType& q, size_t producers, size_t consumer
 
     for (size_t i = 0; i < producers; ++i) {
         threads.emplace_back([&, i]() {
-            mpmc::affinity::pin_current_thread_to_core(static_cast<uint32_t>(i));
+            bench::pin(i);
             mpmc::affinity::set_current_thread_priority_critical();
 
-            while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+            gate.arrive();
 
             for (size_t j = 0; j < ops_per_producer; ++j) {
                 if constexpr (requires { q.try_enqueue(static_cast<uint64_t>(j)); }) {
@@ -484,21 +479,17 @@ double bench_topology_throughput(QueueType& q, size_t producers, size_t consumer
         });
     }
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
 
     for (auto& t : threads) t.join();
-    auto end_time = std::chrono::steady_clock::now();
-
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL_OPS) / elapsed_sec) / 1e6;
 }
 
 double bench_moodycamel_topology(moodycamel::ConcurrentQueue<uint64_t>& q, size_t producers, size_t consumers) {
-    constexpr size_t TOTAL_OPS = 200'000;
+    constexpr size_t TOTAL_OPS = 2'000'000;
     const size_t ops_per_producer = TOTAL_OPS / producers;
 
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(producers + consumers);
     std::atomic<size_t> consumed{0};
 
     std::vector<std::thread> threads;
@@ -506,11 +497,11 @@ double bench_moodycamel_topology(moodycamel::ConcurrentQueue<uint64_t>& q, size_
 
     for (size_t i = 0; i < consumers; ++i) {
         threads.emplace_back([&, i]() {
-            mpmc::affinity::pin_current_thread_to_core(static_cast<uint32_t>(producers + i));
+            bench::pin(producers + i);
             mpmc::affinity::set_current_thread_priority_critical();
             moodycamel::ConsumerToken ctok(q);
 
-            while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+            gate.arrive();
 
             while (consumed.load(std::memory_order_relaxed) < TOTAL_OPS) {
                 uint64_t item = 0;
@@ -522,11 +513,11 @@ double bench_moodycamel_topology(moodycamel::ConcurrentQueue<uint64_t>& q, size_
 
     for (size_t i = 0; i < producers; ++i) {
         threads.emplace_back([&, i]() {
-            mpmc::affinity::pin_current_thread_to_core(static_cast<uint32_t>(i));
+            bench::pin(i);
             mpmc::affinity::set_current_thread_priority_critical();
             moodycamel::ProducerToken ptok(q);
 
-            while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+            gate.arrive();
 
             for (size_t j = 0; j < ops_per_producer; ++j) {
                 q.enqueue(ptok, static_cast<uint64_t>(j));
@@ -534,18 +525,14 @@ double bench_moodycamel_topology(moodycamel::ConcurrentQueue<uint64_t>& q, size_
         });
     }
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
 
     for (auto& t : threads) t.join();
-    auto end_time = std::chrono::steady_clock::now();
-
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL_OPS) / elapsed_sec) / 1e6;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Bulk Throughput Benchmark (1P:1C, Batch = 32, Core 0 -> Core 1)
+// 4. Bulk Throughput Benchmark (1P:1C, Batch = 32, physical core 0 -> 1)
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename QueueType>
 double bench_bulk_throughput(QueueType& q) {
@@ -555,13 +542,13 @@ double bench_bulk_throughput(QueueType& q) {
     std::vector<uint64_t> send_data(TOTAL);
     for (size_t i = 0; i < TOTAL; ++i) send_data[i] = i + 1;
 
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(2);
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
 
-        while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+        gate.arrive();
 
         size_t received = 0;
         std::vector<uint64_t> batch(BATCH_SIZE, 0);
@@ -587,11 +574,10 @@ double bench_bulk_throughput(QueueType& q) {
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
+    gate.arrive();
 
     size_t sent = 0;
     while (sent < TOTAL) {
@@ -617,8 +603,7 @@ double bench_bulk_throughput(QueueType& q) {
     }
 
     consumer.join();
-    auto end_time = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL) / elapsed_sec) / 1e6;
 }
 
@@ -629,14 +614,14 @@ double bench_moodycamel_bulk(moodycamel::ConcurrentQueue<uint64_t>& q) {
     std::vector<uint64_t> send_data(TOTAL);
     for (size_t i = 0; i < TOTAL; ++i) send_data[i] = i + 1;
 
-    std::atomic<bool> start_flag{false};
+    bench::StartGate gate(2);
 
     std::thread consumer([&]() {
-        mpmc::affinity::pin_current_thread_to_core(1);
+        bench::pin(1);
         mpmc::affinity::set_current_thread_priority_critical();
         moodycamel::ConsumerToken ctok(q);
 
-        while (!start_flag.load(std::memory_order_relaxed)) mpmc::cache::cpu_relax();
+        gate.arrive();
 
         size_t received = 0;
         std::vector<uint64_t> batch(BATCH_SIZE, 0);
@@ -648,12 +633,11 @@ double bench_moodycamel_bulk(moodycamel::ConcurrentQueue<uint64_t>& q) {
         }
     });
 
-    mpmc::affinity::pin_current_thread_to_core(0);
+    bench::pin(0);
     mpmc::affinity::set_current_thread_priority_critical();
     moodycamel::ProducerToken ptok(q);
 
-    auto start_time = std::chrono::steady_clock::now();
-    start_flag.store(true, std::memory_order_release);
+    gate.arrive();
 
     size_t sent = 0;
     while (sent < TOTAL) {
@@ -663,17 +647,13 @@ double bench_moodycamel_bulk(moodycamel::ConcurrentQueue<uint64_t>& q) {
     }
 
     consumer.join();
-    auto end_time = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    const double elapsed_sec = gate.seconds_since_open();
     return (static_cast<double>(TOTAL) / elapsed_sec) / 1e6;
 }
 
 int main() {
-    std::cout << "========================================================================================\n";
-    std::cout << "   Lock-Free Queue Comparative Benchmark Suite (Intel Core i7-14700HX, Raptor Lake)\n";
-    std::cout << "   Calibrated Invariant TSC Reference: 2.304011 GHz (0.434026 ns per tick)\n";
-    std::cout << "   Physical P-Cores with THREAD_PRIORITY_TIME_CRITICAL | 10 Runs per Latency Percentile\n";
-    std::cout << "========================================================================================\n\n";
+    std::cout << "Lock-free queue comparison\n";
+    bench::print_host();
 
     constexpr size_t LATENCY_RUNS = 10;
     constexpr size_t WARMUP = 10'000;
@@ -695,17 +675,25 @@ int main() {
         }
         res.latency = aggregate_10_runs(runs);
 
-        mpmc::RingBuffer<uint64_t, 1024> spsc_q;
-        res.spsc_pipelined_mops = bench_spsc_pipelined_throughput(spsc_q);
+        res.spsc_pipelined_mops = bench::repeat([] {
+            mpmc::RingBuffer<uint64_t, 1024> spsc_q;
+            return bench_spsc_pipelined_throughput(spsc_q);
+        });
 
-        mpmc::RingBuffer<uint64_t, 4096> mpmc_2p_q;
-        res.mpmc_2p2c_mops = bench_topology_throughput(mpmc_2p_q, 2, 2);
+        res.mpmc_2p2c_mops = bench::repeat([] {
+            mpmc::RingBuffer<uint64_t, 4096> mpmc_2p_q;
+            return bench_topology_throughput(mpmc_2p_q, 2, 2);
+        });
 
-        mpmc::RingBuffer<uint64_t, 4096> mpmc_4p_q;
-        res.mpmc_4p4c_mops = bench_topology_throughput(mpmc_4p_q, 4, 4);
+        res.mpmc_4p4c_mops = bench::repeat([] {
+            mpmc::RingBuffer<uint64_t, 4096> mpmc_4p_q;
+            return bench_topology_throughput(mpmc_4p_q, 4, 4);
+        });
 
-        mpmc::RingBuffer<uint64_t, 4096> bulk_q;
-        res.bulk_batch32_mops = bench_bulk_throughput(bulk_q);
+        res.bulk_batch32_mops = bench::repeat([] {
+            mpmc::RingBuffer<uint64_t, 4096> bulk_q;
+            return bench_bulk_throughput(bulk_q);
+        });
 
         results.push_back(res);
         std::cout << "      [DONE] mpmc::RingBuffer" << std::endl;
@@ -725,17 +713,25 @@ int main() {
         }
         res.latency = aggregate_10_runs(runs);
 
-        rigtorp::MPMCQueue<uint64_t> spsc_q(1024);
-        res.spsc_pipelined_mops = bench_spsc_pipelined_throughput(spsc_q);
+        res.spsc_pipelined_mops = bench::repeat([] {
+            rigtorp::MPMCQueue<uint64_t> spsc_q(1024);
+            return bench_spsc_pipelined_throughput(spsc_q);
+        });
 
-        rigtorp::MPMCQueue<uint64_t> mpmc_2p_q(4096);
-        res.mpmc_2p2c_mops = bench_topology_throughput(mpmc_2p_q, 2, 2);
+        res.mpmc_2p2c_mops = bench::repeat([] {
+            rigtorp::MPMCQueue<uint64_t> mpmc_2p_q(4096);
+            return bench_topology_throughput(mpmc_2p_q, 2, 2);
+        });
 
-        rigtorp::MPMCQueue<uint64_t> mpmc_4p_q(4096);
-        res.mpmc_4p4c_mops = bench_topology_throughput(mpmc_4p_q, 4, 4);
+        res.mpmc_4p4c_mops = bench::repeat([] {
+            rigtorp::MPMCQueue<uint64_t> mpmc_4p_q(4096);
+            return bench_topology_throughput(mpmc_4p_q, 4, 4);
+        });
 
-        rigtorp::MPMCQueue<uint64_t> bulk_q(4096);
-        res.bulk_batch32_mops = bench_bulk_throughput(bulk_q);
+        res.bulk_batch32_mops = bench::repeat([] {
+            rigtorp::MPMCQueue<uint64_t> bulk_q(4096);
+            return bench_bulk_throughput(bulk_q);
+        });
 
         results.push_back(res);
         std::cout << "      [DONE] rigtorp::MPMCQueue" << std::endl;
@@ -755,13 +751,14 @@ int main() {
         }
         res.latency = aggregate_10_runs(runs);
 
-        rigtorp::SPSCQueue<uint64_t> spsc_q(1024);
-        res.spsc_pipelined_mops = bench_spsc_pipelined_throughput(spsc_q);
-        res.mpmc_2p2c_mops = 0.0;
-        res.mpmc_4p4c_mops = 0.0;
-
-        rigtorp::SPSCQueue<uint64_t> bulk_q(4096);
-        res.bulk_batch32_mops = bench_bulk_throughput(bulk_q);
+        res.spsc_pipelined_mops = bench::repeat([] {
+            rigtorp::SPSCQueue<uint64_t> spsc_q(1024);
+            return bench_spsc_pipelined_throughput(spsc_q);
+        });
+        res.bulk_batch32_mops = bench::repeat([] {
+            rigtorp::SPSCQueue<uint64_t> bulk_q(4096);
+            return bench_bulk_throughput(bulk_q);
+        });
 
         results.push_back(res);
         std::cout << "      [DONE] rigtorp::SPSCQueue" << std::endl;
@@ -781,17 +778,25 @@ int main() {
         }
         res.latency = aggregate_10_runs(runs);
 
-        moodycamel::ConcurrentQueue<uint64_t> spsc_q;
-        res.spsc_pipelined_mops = bench_moodycamel_pipelined_throughput(spsc_q);
+        res.spsc_pipelined_mops = bench::repeat([] {
+            moodycamel::ConcurrentQueue<uint64_t> spsc_q;
+            return bench_moodycamel_pipelined_throughput(spsc_q);
+        });
 
-        moodycamel::ConcurrentQueue<uint64_t> mpmc_2p_q;
-        res.mpmc_2p2c_mops = bench_moodycamel_topology(mpmc_2p_q, 2, 2);
+        res.mpmc_2p2c_mops = bench::repeat([] {
+            moodycamel::ConcurrentQueue<uint64_t> mpmc_2p_q;
+            return bench_moodycamel_topology(mpmc_2p_q, 2, 2);
+        });
 
-        moodycamel::ConcurrentQueue<uint64_t> mpmc_4p_q;
-        res.mpmc_4p4c_mops = bench_moodycamel_topology(mpmc_4p_q, 4, 4);
+        res.mpmc_4p4c_mops = bench::repeat([] {
+            moodycamel::ConcurrentQueue<uint64_t> mpmc_4p_q;
+            return bench_moodycamel_topology(mpmc_4p_q, 4, 4);
+        });
 
-        moodycamel::ConcurrentQueue<uint64_t> bulk_q;
-        res.bulk_batch32_mops = bench_moodycamel_bulk(bulk_q);
+        res.bulk_batch32_mops = bench::repeat([] {
+            moodycamel::ConcurrentQueue<uint64_t> bulk_q;
+            return bench_moodycamel_bulk(bulk_q);
+        });
 
         results.push_back(res);
         std::cout << "      [DONE] moodycamel::ConcurrentQueue" << std::endl;
@@ -811,17 +816,25 @@ int main() {
         }
         res.latency = aggregate_10_runs(runs);
 
-        MutexDequeQueue<uint64_t> spsc_q(1024);
-        res.spsc_pipelined_mops = bench_spsc_pipelined_throughput(spsc_q);
+        res.spsc_pipelined_mops = bench::repeat([] {
+            MutexDequeQueue<uint64_t> spsc_q(1024);
+            return bench_spsc_pipelined_throughput(spsc_q);
+        });
 
-        MutexDequeQueue<uint64_t> mpmc_2p_q(4096);
-        res.mpmc_2p2c_mops = bench_topology_throughput(mpmc_2p_q, 2, 2);
+        res.mpmc_2p2c_mops = bench::repeat([] {
+            MutexDequeQueue<uint64_t> mpmc_2p_q(4096);
+            return bench_topology_throughput(mpmc_2p_q, 2, 2);
+        });
 
-        MutexDequeQueue<uint64_t> mpmc_4p_q(4096);
-        res.mpmc_4p4c_mops = bench_topology_throughput(mpmc_4p_q, 4, 4);
+        res.mpmc_4p4c_mops = bench::repeat([] {
+            MutexDequeQueue<uint64_t> mpmc_4p_q(4096);
+            return bench_topology_throughput(mpmc_4p_q, 4, 4);
+        });
 
-        MutexDequeQueue<uint64_t> bulk_q(4096);
-        res.bulk_batch32_mops = bench_bulk_throughput(bulk_q);
+        res.bulk_batch32_mops = bench::repeat([] {
+            MutexDequeQueue<uint64_t> bulk_q(4096);
+            return bench_bulk_throughput(bulk_q);
+        });
 
         results.push_back(res);
         std::cout << "      [DONE] std::mutex + std::deque" << std::endl;
@@ -830,7 +843,7 @@ int main() {
     // ── Table 1: Paced True One-Way Handoff Latency ─────────────────────────
     std::cout << "\n\n";
     std::cout << "=======================================================================================================================\n";
-    std::cout << "             TABLE 1: PACED TRUE ONE-WAY LATENCY (Core 0 -> Core 1, 10 Runs x 50,000 samples)\n";
+    std::cout << "             TABLE 1: PACED TRUE ONE-WAY LATENCY (physical core 0 -> 1, 10 Runs x 50,000 samples)\n";
     std::cout << "             Measurement: Enqueue-call to Dequeue-return (including CAS claim & sequence store)\n";
     std::cout << "=======================================================================================================================\n";
     std::cout << std::left
@@ -845,12 +858,12 @@ int main() {
 
     for (const auto& r : results) {
         auto format_val = [](double ticks) {
-            double ns = ticks * kNsPerTscTick;
+            double ns = ticks * bench::ns_per_tick();
             return std::to_string(static_cast<int>(ticks)) + "t / " + std::to_string(static_cast<int>(ns)) + "ns";
         };
 
         std::string p50_str = std::to_string(static_cast<int>(r.latency.p50_med)) + "t (" +
-                              std::to_string(static_cast<int>(r.latency.p50_med * kNsPerTscTick)) + "ns) [" +
+                              std::to_string(static_cast<int>(r.latency.p50_med * bench::ns_per_tick())) + "ns) [" +
                               std::to_string(static_cast<int>(r.latency.p50_min)) + "-" +
                               std::to_string(static_cast<int>(r.latency.p50_max)) + "t]";
 
@@ -864,49 +877,17 @@ int main() {
                   << "\n";
     }
 
-    // ── Table 2: Streaming Throughput by Topology ───────────────────
-    std::cout << "\n\n";
-    std::cout << "=======================================================================================================================\n";
-    std::cout << "             TABLE 2: STREAMING THROUGHPUT BY TOPOLOGY ACROSS PHYSICAL P-CORES\n";
-    std::cout << "=======================================================================================================================\n";
-    std::cout << std::left
-              << std::setw(28) << "Queue Implementation"
-              << std::setw(26) << "Pattern"
-              << std::setw(18) << "1P:1C (2 cores)"
-              << std::setw(18) << "2P:2C (4 cores)"
-              << std::setw(18) << "4P:4C (8 cores)"
-              << std::setw(22) << "1P:1C Bulk (Batch=32)"
-              << "\n";
-    std::cout << std::string(130, '-') << "\n";
-
+    // Table 2: throughput by topology
+    std::cout << "\n\nTABLE 2: THROUGHPUT, M ops/s, median [min-max] of " << bench::kThroughputRuns << " runs\n";
+    std::cout << std::left << std::setw(30) << "Queue" << std::setw(24) << "1P:1C" << std::setw(24) << "2P:2C"
+              << std::setw(24) << "4P:4C" << std::setw(24) << "1P:1C batch=32" << "\n";
+    std::cout << std::string(126, '-') << "\n";
     for (const auto& r : results) {
-        std::string spsc_str = std::to_string(r.spsc_pipelined_mops).substr(0, 5) + " M ops/s";
-        std::string mpmc_2p_str = (r.mpmc_2p2c_mops > 0.0) 
-            ? (std::to_string(r.mpmc_2p2c_mops).substr(0, 5) + " M ops/s")
-            : "N/A (SPSC-only)";
-        std::string mpmc_4p_str = (r.mpmc_4p4c_mops > 0.0) 
-            ? (std::to_string(r.mpmc_4p4c_mops).substr(0, 5) + " M ops/s")
-            : "N/A (SPSC-only)";
-        std::string bulk_str = std::to_string(r.bulk_batch32_mops).substr(0, 5) + " M ops/s";
-
-        std::cout << std::left
-                  << std::setw(28) << r.name
-                  << std::setw(26) << r.pattern
-                  << std::setw(18) << spsc_str
-                  << std::setw(18) << mpmc_2p_str
-                  << std::setw(18) << mpmc_4p_str
-                  << std::setw(22) << bulk_str
-                  << "\n";
+        auto cell = [](const bench::Summary& v) { return v.median > 0.0 ? bench::format(v) : std::string("N/A"); };
+        std::cout << std::left << std::setw(30) << r.name << std::setw(24) << cell(r.spsc_pipelined_mops)
+                  << std::setw(24) << cell(r.mpmc_2p2c_mops) << std::setw(24) << cell(r.mpmc_4p4c_mops)
+                  << std::setw(24) << cell(r.bulk_batch32_mops) << "\n";
     }
-
-    std::cout << "=======================================================================================================================\n";
-    std::cout << " Run Hygiene & Methodology Disclosures:\n";
-    std::cout << "  - Host: Intel Core i7-14700HX (Raptor Lake, 8 P-Cores, 12 E-Cores). Plugged into AC power, High Performance plan.\n";
-    std::cout << "  - Thread Affinity: All threads pinned to distinct physical P-Cores (Cores 0-7) with THREAD_PRIORITY_TIME_CRITICAL.\n";
-    std::cout << "  - Timing: Invariant TSC reference calibrated at 2.304011 GHz (0.434026 ns/tick).\n";
-    std::cout << "  - One-Way Latency: Paced queue (depth ~0). Producer stamps rdtsc_start() before enqueue, consumer reads rdtsc_end().\n";
-    std::cout << "  - Statistics: Median across 10 runs of each percentile, with [min-max] range and worst-case max observed.\n";
-    std::cout << "=======================================================================================================================\n\n";
 
     return 0;
 }

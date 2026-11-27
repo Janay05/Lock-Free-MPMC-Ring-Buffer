@@ -47,7 +47,7 @@ namespace detail {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RingBufferBase — CRTP base containing lock-free Vyukov sequence CAS mechanics
+// RingBufferBase — CRTP base containing Vyukov sequence CAS mechanics
 //
 // Derived classes implement two compile-time policy hooks via static dispatch:
 //   bool on_full(size_t& pos)  — invoked when try_enqueue finds the buffer full
@@ -55,11 +55,13 @@ namespace detail {
 //
 // SlotAlignment:  Alignment & size of each slot (64B standard, 128B for prefetcher ablation)
 // IndexAlignment: Alignment & isolation of head_ and tail_ (64B standard, 128B for prefetcher ablation)
+// MaxBackoff:     Cap on pauses between CAS retries (see CasBackoff)
 // Zero virtual dispatch, zero vtable pointers.
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename Derived, typename T, std::size_t Capacity,
           std::size_t SlotAlignment = kCacheLineSize,
-          std::size_t IndexAlignment = kCacheLineSize>
+          std::size_t IndexAlignment = kCacheLineSize,
+          uint32_t MaxBackoff = 1>
 class RingBufferBase {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of 2");
     static_assert(Capacity >= 2,                    "Capacity must be at least 2");
@@ -98,6 +100,7 @@ public:
     template <typename U = T>
     [[nodiscard]] bool try_enqueue(U&& item) noexcept {
         std::size_t pos = head_.load(std::memory_order_relaxed); // Hint only; CAS corrects stale reads
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
             SlotType* slot = &slots_[pos & kMask];
@@ -115,7 +118,7 @@ public:
                     slot->sequence.store(pos + 1, std::memory_order_release);
                     return true;
                 }
-                cache::cpu_relax(); // Backoff on CAS collision
+                backoff.pause();
             } else if (diff < 0) {
                 // Buffer is full (seq < pos); consumer hasn't drained previous turn
                 if (derived().on_full(pos)) {
@@ -132,6 +135,7 @@ public:
     template <typename U = T>
     [[nodiscard]] bool try_enqueue(U&& item, QueueStats& stats) noexcept {
         std::size_t pos = head_.load(std::memory_order_relaxed);
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
             SlotType* slot = &slots_[pos & kMask];
@@ -148,7 +152,7 @@ public:
                     return true;
                 }
                 ++stats.enqueue_cas_fail;
-                cache::cpu_relax();
+                backoff.pause();
             } else if (diff < 0) {
                 if (derived().on_full(pos)) {
                     continue;
@@ -164,6 +168,7 @@ public:
     // ── Single-Item Dequeue ──────────────────────────────────────────────────
     [[nodiscard]] bool try_dequeue(T& out_item) noexcept {
         std::size_t pos = tail_.load(std::memory_order_relaxed); // Hint only; CAS corrects stale reads
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
             SlotType* slot = &slots_[pos & kMask];
@@ -181,7 +186,7 @@ public:
                     slot->sequence.store(pos + kMask + 1, std::memory_order_release);
                     return true;
                 }
-                cache::cpu_relax(); // Backoff on CAS collision
+                backoff.pause();
             } else if (diff < 0) {
                 // Buffer is empty (seq < pos + 1); producer has not published this slot yet
                 if (derived().on_empty(pos)) {
@@ -197,6 +202,7 @@ public:
 
     [[nodiscard]] bool try_dequeue(T& out_item, QueueStats& stats) noexcept {
         std::size_t pos = tail_.load(std::memory_order_relaxed);
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
             SlotType* slot = &slots_[pos & kMask];
@@ -213,7 +219,7 @@ public:
                     return true;
                 }
                 ++stats.dequeue_cas_fail;
-                cache::cpu_relax();
+                backoff.pause();
             } else if (diff < 0) {
                 if (derived().on_empty(pos)) {
                     continue;
@@ -226,133 +232,103 @@ public:
         }
     }
 
-    // ── Bulk Enqueue (Amortized CAS) ─────────────────────────────────────────
+    // ── Bulk Operations (one CAS per batch) ──
+    // Each claims the longest run of already-ready slots (up to max_count) with a
+    // single CAS. Neither waits on another thread: a slot held by a stalled peer
+    // ends the run. Returns the number of items transferred, possibly 0.
     [[nodiscard]] std::size_t try_enqueue_bulk(const T* items, std::size_t max_count) noexcept {
-        if (__builtin_expect(max_count == 0, 0)) return 0;
-
-        std::size_t pos = head_.load(std::memory_order_relaxed);
-
-        for (;;) {
-            std::size_t current_tail = tail_.load(std::memory_order_relaxed);
-            std::size_t occupied     = pos - current_tail;
-            if (occupied >= Capacity) return 0;
-
-            std::size_t available = Capacity - occupied;
-            std::size_t to_claim  = (max_count < available) ? max_count : available;
-            if (to_claim == 0) return 0;
-
-            if (head_.compare_exchange_weak(pos, pos + to_claim,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                for (std::size_t i = 0; i < to_claim; ++i) {
-                    SlotType* slot = &slots_[(pos + i) & kMask];
-                    SpinWait bk;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
-                        bk.spin();
-                    slot->data() = items[i];
-                    slot->sequence.store(pos + i + 1, std::memory_order_release);
-                }
-                return to_claim;
-            }
-            cache::cpu_relax();
-        }
+        QueueStats unused;
+        return try_enqueue_bulk(items, max_count, unused);
     }
 
     [[nodiscard]] std::size_t try_enqueue_bulk(const T* items, std::size_t max_count, QueueStats& stats) noexcept {
         if (__builtin_expect(max_count == 0, 0)) return 0;
 
         std::size_t pos = head_.load(std::memory_order_relaxed);
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
-            std::size_t current_tail = tail_.load(std::memory_order_relaxed);
-            std::size_t occupied     = pos - current_tail;
-            if (occupied >= Capacity) {
-                ++stats.enqueue_full;
-                return 0;
+            std::size_t count = 0;
+            intptr_t diff     = 0;
+            while (count < max_count) {
+                // Acquire pairs with the consumer's release of the previous lap
+                const std::size_t seq = slots_[(pos + count) & kMask].sequence.load(std::memory_order_acquire);
+                diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + count);
+                if (diff != 0) break;
+                ++count;
             }
 
-            std::size_t available = Capacity - occupied;
-            std::size_t to_claim  = (max_count < available) ? max_count : available;
-            if (to_claim == 0) return 0;
+            if (count == 0) {
+                if (diff < 0) {
+                    ++stats.enqueue_full;
+                    return 0;
+                }
+                pos = head_.load(std::memory_order_relaxed); // pos was stale
+                continue;
+            }
 
-            if (head_.compare_exchange_weak(pos, pos + to_claim,
+            // A scanned slot can only change after head_ passes it, so a successful
+            // CAS proves every slot in [pos, pos + count) is still ours to use.
+            if (head_.compare_exchange_weak(pos, pos + count,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
-                for (std::size_t i = 0; i < to_claim; ++i) {
+                for (std::size_t i = 0; i < count; ++i) {
                     SlotType* slot = &slots_[(pos + i) & kMask];
-                    SpinWait bk;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i))
-                        bk.spin();
                     slot->data() = items[i];
                     slot->sequence.store(pos + i + 1, std::memory_order_release);
                 }
-                stats.enqueue_success += to_claim;
-                return to_claim;
+                stats.enqueue_success += count;
+                return count;
             }
             ++stats.enqueue_cas_fail;
-            cache::cpu_relax();
+            backoff.pause();
         }
     }
 
-    // ── Bulk Dequeue (Amortized CAS) ─────────────────────────────────────────
     [[nodiscard]] std::size_t try_dequeue_bulk(T* out_items, std::size_t max_count) noexcept {
-        if (__builtin_expect(max_count == 0, 0)) return 0;
-
-        std::size_t pos = tail_.load(std::memory_order_relaxed);
-
-        for (;;) {
-            std::size_t current_head = head_.load(std::memory_order_relaxed);
-            if (pos >= current_head) return 0;
-
-            std::size_t available = current_head - pos;
-            std::size_t to_claim  = (max_count < available) ? max_count : available;
-            if (to_claim == 0) return 0;
-
-            if (tail_.compare_exchange_weak(pos, pos + to_claim,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                for (std::size_t i = 0; i < to_claim; ++i) {
-                    SlotType* slot = &slots_[(pos + i) & kMask];
-                    SpinWait bk;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
-                        bk.spin();
-                    out_items[i] = std::move(slot->data());
-                    slot->sequence.store(pos + i + kMask + 1, std::memory_order_release);
-                }
-                return to_claim;
-            }
-            cache::cpu_relax();
-        }
+        QueueStats unused;
+        return try_dequeue_bulk(out_items, max_count, unused);
     }
 
     [[nodiscard]] std::size_t try_dequeue_bulk(T* out_items, std::size_t max_count, QueueStats& stats) noexcept {
         if (__builtin_expect(max_count == 0, 0)) return 0;
 
         std::size_t pos = tail_.load(std::memory_order_relaxed);
+        CasBackoff<MaxBackoff> backoff;
 
         for (;;) {
-            std::size_t current_head = head_.load(std::memory_order_relaxed);
-            if (pos >= current_head) {
-                ++stats.dequeue_empty;
-                return 0;
+            std::size_t count = 0;
+            intptr_t diff     = 0;
+            while (count < max_count) {
+                // Acquire pairs with the producer's release publication
+                const std::size_t seq = slots_[(pos + count) & kMask].sequence.load(std::memory_order_acquire);
+                diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + count + 1);
+                if (diff != 0) break;
+                ++count;
             }
 
-            std::size_t available = current_head - pos;
-            std::size_t to_claim  = (max_count < available) ? max_count : available;
-            if (to_claim == 0) return 0;
+            if (count == 0) {
+                if (diff < 0) {
+                    ++stats.dequeue_empty;
+                    return 0;
+                }
+                pos = tail_.load(std::memory_order_relaxed); // pos was stale
+                continue;
+            }
 
-            if (tail_.compare_exchange_weak(pos, pos + to_claim,
+            // A scanned slot can only change after tail_ passes it, so a successful
+            // CAS proves every slot in [pos, pos + count) is still ours to use.
+            if (tail_.compare_exchange_weak(pos, pos + count,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
-                for (std::size_t i = 0; i < to_claim; ++i) {
+                for (std::size_t i = 0; i < count; ++i) {
                     SlotType* slot = &slots_[(pos + i) & kMask];
-                    SpinWait bk;
-                    while (slot->sequence.load(std::memory_order_acquire) != (pos + i + 1))
-                        bk.spin();
                     out_items[i] = std::move(slot->data());
                     slot->sequence.store(pos + i + kMask + 1, std::memory_order_release);
                 }
-                stats.dequeue_success += to_claim;
-                return to_claim;
+                stats.dequeue_success += count;
+                return count;
             }
             ++stats.dequeue_cas_fail;
-            cache::cpu_relax();
+            backoff.pause();
         }
     }
 
@@ -412,11 +388,12 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename T = void*, std::size_t Capacity = 1024,
           std::size_t SlotAlignment = kCacheLineSize,
-          std::size_t IndexAlignment = kCacheLineSize>
-class RingBuffer : public RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment> {
-    friend class RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>;
+          std::size_t IndexAlignment = kCacheLineSize,
+          uint32_t MaxBackoff = 1>
+class RingBuffer : public RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff> {
+    friend class RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>;
 public:
-    using RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>::RingBufferBase;
+    using RingBufferBase<RingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>::RingBufferBase;
 
 private:
     [[nodiscard]] bool on_full(std::size_t&) noexcept { return false; }
@@ -432,12 +409,13 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename T = void*, std::size_t Capacity = 1024,
           std::size_t SlotAlignment = kCacheLineSize,
-          std::size_t IndexAlignment = kCacheLineSize>
+          std::size_t IndexAlignment = kCacheLineSize,
+          uint32_t MaxBackoff = 1>
 class SpinningRingBuffer
-    : public RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment> {
-    friend class RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>;
+    : public RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff> {
+    friend class RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>;
 public:
-    using RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment>, T, Capacity, SlotAlignment, IndexAlignment>::RingBufferBase;
+    using RingBufferBase<SpinningRingBuffer<T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>, T, Capacity, SlotAlignment, IndexAlignment, MaxBackoff>::RingBufferBase;
 
 private:
     [[nodiscard]] bool on_full(std::size_t& pos) noexcept {

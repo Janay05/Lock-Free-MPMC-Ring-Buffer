@@ -1,0 +1,56 @@
+MPMC ring buffer pinned benchmarks
+Physical cores available (logical CPU ids): 0 2 4 6 8 10 12 14
+Measured TSC period: 0.434028 ns/tick (2.3040 GHz)
+
+
+========================================================================
+ [BENCHMARK 1] Paced True One-Way Latency Across Physical Cores (physical core 0 -> 1)
+               Measurement: send_tsc stamped immediately before try_enqueue
+                            recv_tsc stamped immediately upon try_dequeue
+               Queue depth: ~0 (paced producer waits for consumer drain ack)
+               Sample size: 10 runs x 100,000 samples per mode
+========================================================================
+
+--- Cross-Core TSC Monotonicity & Invariant Synchronization ---
+  Negative TSC Latency Anomalies: 0 / 2000000 observations
+
+--- 10-Run Aggregated True One-Way Handoff Latency ---
+  Mode A (Pure Busy-Poll):      p50: 256.0t (111.1ns) [184.0-272.0t] | p90: 288.0t (125.0ns) | p99: 288.0t (125.0ns) | p99.9: 304.0t (131.9ns) | Worst Max: 1439150.0t (624.6µs)
+  Mode B (_mm_pause Backoff):   p50: 176.0t (76.4ns) [176.0-256.0t] | p90: 220.0t (95.5ns) | p99: 272.0t (118.1ns) | p99.9: 320.0t (138.9ns) | Worst Max: 1371378.0t (595.2µs)
+
+========================================================================
+ [BENCHMARK 2] Split Padding Ablation: Spatial Prefetcher Interference
+               Config 1: 64B Slot  /  64B Head-Tail Alignment (Baseline)
+               Config 2: 64B Slot  / 128B Head-Tail Separation
+               Config 3: 128B Slot / 128B Head-Tail Separation
+========================================================================
+--- 10-Run Aggregated Latency Across Padding Configurations ---
+  Config 1 (64B Slot / 64B HT): p50: 256.0t (111.1ns) [256.0-272.0t] | p90: 288.0t (125.0ns) | p99: 288.0t (125.0ns) | p99.9: 304.0t (131.9ns) | Worst Max: 1190078.0t (516.5µs)
+  Config 2 (64B Slot / 128B HT):p50: 256.0t (111.1ns) [256.0-272.0t] | p90: 288.0t (125.0ns) | p99: 288.0t (125.0ns) | p99.9: 304.0t (131.9ns) | Worst Max: 1430098.0t (620.7µs)
+  Config 3 (128B Slot / 128B HT):p50: 184.0t (79.9ns) [184.0-192.0t] | p90: 272.0t (118.1ns) | p99: 288.0t (125.0ns) | p99.9: 304.0t (131.9ns) | Worst Max: 1363856.0t (592.0µs)
+
+========================================================================
+ [BENCHMARK 3] Empirical Contention Scaling on Physical P-Cores
+               Topologies strictly within 8 physical P-cores (no SMT/E-cores)
+               Tracking exact CAS collision rate via QueueStats
+========================================================================
+  - 1P:1C  M ops/s 19.5 [18.8-19.7] | failed CAS: producer 0.0%, consumer 0.0%
+  - 2P:2C  M ops/s 7.4 [6.9-9.9] | failed CAS: producer 32.8%, consumer 30.2%
+  - 4P:4C  M ops/s 6.7 [6.4-7.0] | failed CAS: producer 65.5%, consumer 66.7%
+
+========================================================================
+ [BENCHMARK 4] Bulk Operations Batch Amortization (1P:1C Pinned)
+========================================================================
+  - batch 1  M items/s 10.9 [10.6-11.6]
+  - batch 8  M items/s 56.3 [51.8-117.5]
+  - batch 16  M items/s 182.6 [164.3-234.3]
+  - batch 32  M items/s 256.6 [240.5-296.5]
+
+ [BENCHMARK 5] Spin-wait primitives (includes timer overhead, see empty row)
+  - empty              p50 15.6 ns, p99 17.4 ns, max 84.8 us
+  - cpu_relax (pause)  p50 59.0 ns, p99 62.5 ns, max 336.5 us
+  - this_thread::yield p50 93.8 ns, p99 100.7 ns, max 571.6 us
+
+========================================================================
+ [ALL BENCHMARKS AND ABLATIONS COMPLETED SUCCESSFULLY]
+========================================================================

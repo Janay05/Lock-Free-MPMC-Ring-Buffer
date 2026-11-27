@@ -10,11 +10,12 @@
 #include <numeric>
 #include <iostream>
 #include <iomanip>
+#include <string>
 
 namespace mpmc {
 
 /**
- * Lock-Free Latency Histogram
+ * Atomic Latency Histogram
  *
  * Designed for sub-nanosecond / cycle-accurate latency profiling in HFT pipelines.
  * Features:
@@ -84,7 +85,7 @@ public:
 
     /**
      * Record a latency observation (e.g. cycles or nanoseconds).
-     * O(1), lock-free, zero syscalls.
+     * O(1), no locks, no syscalls.
      */
     inline void record(uint64_t value) noexcept {
         std::size_t b = value_to_bucket(value);
@@ -92,13 +93,13 @@ public:
         total_count_.fetch_add(1, std::memory_order_relaxed);
         total_sum_.fetch_add(value, std::memory_order_relaxed);
 
-        // Update min value lock-free
+        // Update min value without locks
         uint64_t current_min = min_val_.load(std::memory_order_relaxed);
         while (value < current_min && 
                !min_val_.compare_exchange_weak(current_min, value, std::memory_order_relaxed)) {
         }
 
-        // Update max value lock-free
+        // Update max value without locks
         uint64_t current_max = max_val_.load(std::memory_order_relaxed);
         while (value > current_max && 
                !max_val_.compare_exchange_weak(current_max, value, std::memory_order_relaxed)) {

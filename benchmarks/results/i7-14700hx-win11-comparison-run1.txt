@@ -1,0 +1,37 @@
+Lock-free queue comparison
+Physical cores available (logical CPU ids): 0 2 4 6 8 10 12 14
+Measured TSC period: 0.434028 ns/tick (2.3040 GHz)
+
+[1/5] Benchmarking mpmc::RingBuffer (Ours - In-line Value Mode)...
+      [DONE] mpmc::RingBuffer
+[2/5] Benchmarking rigtorp::MPMCQueue (Bounded MPMC Reference)...
+      [DONE] rigtorp::MPMCQueue
+[3/5] Benchmarking rigtorp::SPSCQueue (Dedicated SPSC Baseline)...
+      [DONE] rigtorp::SPSCQueue
+[4/5] Benchmarking moodycamel::ConcurrentQueue (Unbounded Block Token)...
+      [DONE] moodycamel::ConcurrentQueue
+[5/5] Benchmarking MutexDequeQueue (std::mutex + std::deque)...
+      [DONE] std::mutex + std::deque
+
+
+=======================================================================================================================
+             TABLE 1: PACED TRUE ONE-WAY LATENCY (physical core 0 -> 1, 10 Runs x 50,000 samples)
+             Measurement: Enqueue-call to Dequeue-return (including CAS claim & sequence store)
+=======================================================================================================================
+Queue Implementation        p50 [min-max]         p90               p99               p99.9             Worst Max         
+--------------------------------------------------------------------------------------------------------------------------
+mpmc::RingBuffer (Ours)     272t (118ns) [184-272t]304t / 131ns      320t / 138ns      1376t / 597ns     1491098t / 647178ns
+rigtorp::MPMCQueue          244t (105ns) [232-256t]288t / 125ns      336t / 145ns      496t / 215ns      1497308t / 649873ns
+rigtorp::SPSCQueue          264t (114ns) [168-384t]384t / 166ns      400t / 173ns      416t / 180ns      1392406t / 604343ns
+moodycamel::ConcurrentQueue 640t (277ns) [496-704t]688t / 298ns      1344t / 583ns     1536t / 666ns     1475496t / 640406ns
+std::mutex + std::deque     1600t (694ns) [1216-1600t]1632t / 708ns     5888t / 2555ns    13056t / 5666ns   1488710t / 646142ns
+
+
+TABLE 2: THROUGHPUT, M ops/s, median [min-max] of 11 runs
+Queue                         1P:1C                   2P:2C                   4P:4C                   1P:1C batch=32          
+------------------------------------------------------------------------------------------------------------------------------
+mpmc::RingBuffer (Ours)       112.0 [23.5-119.1]      9.9 [8.4-10.1]          5.8 [5.7-6.3]           261.7 [249.4-305.6]     
+rigtorp::MPMCQueue            60.1 [56.2-64.1]        9.4 [9.3-9.7]           8.8 [8.3-9.0]           58.2 [55.1-66.7]        
+rigtorp::SPSCQueue            231.2 [139.7-294.7]     N/A                     N/A                     54.8 [45.9-305.9]       
+moodycamel::ConcurrentQueue   40.9 [39.6-44.2]        24.5 [23.7-26.3]        23.0 [22.3-23.8]        203.9 [135.5-259.2]     
+std::mutex + std::deque       4.7 [4.4-5.6]           15.8 [15.1-17.5]        15.0 [14.3-16.4]        69.2 [34.8-95.2]        

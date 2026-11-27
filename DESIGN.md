@@ -6,11 +6,11 @@ This document provides a formal breakdown of the architectural design decisions,
 
 ## 1. Architectural Overview & Slot Layout
 
-The queue is a bounded circular array derived from Dmitry Vyukov's algorithm, extended to support zero-copy inline payload storage and contiguous bulk atomic operations.
+The queue is a bounded circular array derived from Dmitry Vyukov's algorithm, extended to support inline payload storage and contiguous bulk atomic operations.
 
 ### Dual-Mode Slot Architecture
 
-In low-latency data feeds, payload transfer overhead dominates queue transport latency. Storing an 8-byte pointer to a heap-allocated struct induces a second cache-line miss on the consumer core.
+Storing an 8-byte pointer to a heap-allocated struct induces a second cache-line miss on the consumer core.
 
 To eliminate this, `Slot<T>` provides **dual-mode storage** within a fixed 64-byte boundary:
 
@@ -44,7 +44,7 @@ The queue synchronizes concurrently executing threads without mutexes using a se
 | `try_dequeue` | `tail_` | `compare_exchange_weak` | `relaxed` | N/A | Consumer ticket reservation. |
 | `try_dequeue` | `slot->sequence` | `load` | `acquire` | `try_enqueue` release store (`pos + 1`) | **Critical**: Synchronizes with producer's release store. Guarantees the consumer does not read stale/uninitialized data from `slot->value` before producer finishes writing. |
 | `try_dequeue` | `slot->sequence` | `store` | `release` | `try_enqueue` acquire load (`pos + Capacity`) | **Critical**: Guarantees consumer finishes copying `slot->value` out before releasing the slot for wrap-around reuse by generation $N+1$ producers. |
-| `SpinningRingBuffer` | `tail_` | `load` | `acquire` | Enqueue release store | Ensures approximate queue depth checks observe committed enqueue writes. |
+| `SpinningRingBuffer` | `head_` / `tail_` | `load` | `relaxed` | N/A | Refreshes the position hint after a full or empty result; the slot sequence provides the ordering. |
 
 ### Generational Monotonic Sequences & ABA Immunity
 
@@ -54,10 +54,12 @@ $$\text{Initial: } \text{seq} = i$$
 $$\text{After Enqueue: } \text{seq} = \text{pos} + 1$$
 $$\text{After Dequeue: } \text{seq} = \text{pos} + \text{Capacity}$$
 
-**Why `pos + Capacity` instead of `pos + 1`?**
-When the buffer wraps around on generation $N+1$, a producer claims index $\text{pos}' = \text{pos} + \text{Capacity}$. It requires $\text{slot}\to\text{sequence} == \text{pos}'$. 
-If the consumer on generation $N$ had merely set $\text{sequence} = \text{pos} + 2$, a wrap-around producer could not distinguish between a completed dequeue and an un-dequeued slot from generation $N+1$. 
-Incrementing by `Capacity` guarantees that a slot is marked ready for the exact generation matching the advancing queue head. Because sequences are 64-bit unsigned integers, wrap-around ABA is mathematically impossible over the lifespan of the process ($>584$ years at 1 billion ops/sec).
+**Why `pos + Capacity`?**
+The next producer to use this slot holds position `pos + Capacity` and waits for `sequence == pos + Capacity`. Storing that value hands the slot to exactly that lap. Sequences are 64-bit, so wrapping them would take centuries at a billion operations per second.
+
+### Batch Operations
+
+A batch operation scans forward from the current index, counting consecutive ready slots, then claims that run with one CAS. A scanned slot can change only after the index moves past it, so a successful CAS proves the whole run is still ready. No batch call waits for another thread; it returns a partial count instead. The acquire load of each slot during the scan provides the happens-before edge for that slot's payload.
 
 ---
 
@@ -88,46 +90,25 @@ Under these conditions, involuntary kernel preemption on the hot path is practic
 
 ## 4. Micro-Architectural Trade-Offs
 
-### 1. False Sharing vs. Adjacent Cache Line Prefetching (64B vs 128B)
+Measured values are in the [README](README.md#results); this section covers the reasoning.
 
-Modern x86-64 processors (Intel Core / Xeon) feature two levels of hardware prefetchers in L1D and L2:
-* **Stream Prefetcher**: Detects sequential access streams.
-* **Spatial Prefetcher (Adjacent Cache Line Prefetcher)**: Fetches pairs of 64-byte lines (a 128-byte aligned sector).
+### False sharing and adjacent-line prefetching
 
-If `head_` and `tail_` are separated by 64 bytes of padding, they reside on separate 64-byte lines, which prevents standard MESI false sharing. However, if they fall within the same 128-byte aligned sector, the L2 spatial prefetcher may speculatively request the adjacent line, inducing cross-core coherency traffic.
+`head_`, `tail_` and each slot sit on separate 64-byte lines. Some Intel prefetchers fetch lines in 128-byte pairs, so template parameters allow 128-byte alignment. On the test machine, wider index separation had no measurable effect on the median, while 128-byte slots lowered median handoff latency at twice the memory cost. The mechanism has not been confirmed with hardware counters.
 
-* **Empirical Ablation Finding**:
-  * Config 1 (64B Slot / 64B Head-Tail): **45.1 ns** ($p50$)
-  * Config 2 (64B Slot / 128B Head-Tail): **45.1 ns** ($p50$)
-  * Config 3 (128B Slot / 128B Head-Tail): **50.3 ns** ($p50$)
-* **Conclusion**: Separating `head_` and `tail_` to 128B yields a **null result**—prefetcher interference between indices is negligible once they are isolated to distinct 64B lines. Padded 128B slots slightly increase latency (+5.2 ns) due to greater L1/L2 cache footprint.
+### Busy-polling and `pause`
 
-### 2. User-Space Backoff: Pure Busy-Wait vs. `_mm_pause`
+`pause` reduces power use and pressure on an SMT sibling, at the possible cost of delaying the next poll. On the test machine the paced one-way median was lower with `pause` than without, with overlapping run ranges.
 
-The backoff loop in `SpinningRingBuffer` calls `cache::cpu_relax()` on each failed attempt. On x86-64, this emits `_mm_pause()` (`rep nop`).
+### Contention
 
-* **Empirical Cost & Measured Delta**:
-  * On Intel Raptor Lake (14700HX), `_mm_pause()` introduces a pipeline delay of **~42.5 ns (98 TSC ticks)**.
-  * In our 10-run ablation on physical cores, pure busy-polling achieves **45.1 ns** ($p50$) / **53.0 ns** ($p99$), whereas `_mm_pause()` achieves **50.3 ns** ($p50$) / **59.0 ns** ($p99$).
-* **Trade-off Analysis**:
-  * In a dedicated 1P:1C pipeline where a consumer waits for a producer, inserting a 42.5 ns pause adds ~5 ns to median handoff latency and up to 40 ns of jitter if the producer publishes right after the pause begins.
-  * Conversely, a pure busy-poll loop burns 100% of the core's execution pipeline, starves hyper-threading sibling threads (SMT), and increases core power.
-* **Guideline**: In ultra-low latency scenarios with dedicated non-hyperthreaded cores (`isolcpus`), pure busy-polling minimizes tail handoff latency. When sharing cores or in multi-tenant environments, `_mm_pause()` is essential.
-
-### 3. Contended Multi-Producer Bottlenecks (Single-CAS vs Token Queues)
-
-At 4P:4C, streaming throughput is **11.53M ops/s**, compared to **19.28M ops/s** for `moodycamel::ConcurrentQueue`.
-* **Empirical Contention Telemetry**:
-  * 1P:1C: 60.49M ops/s, 0.00% CAS collision rate (0 fails)
-  * 2P:2C: 19.63M ops/s, 40.00% CAS collision rate (1,333,470 fails)
-  * 4P:4C: 11.33M ops/s, 63.39% CAS collision rate (3,463,038 fails)
-* **Explanation**: All 4 producers contend on the single `head_` atomic counter via `LOCK CMPXCHG`. The cache line containing `head_` must bounce across the L3 interconnect between all 4 producer cores for every claim.
-* **Comparison with Moodycamel**: Moodycamel distributes producers across thread-local block queues, eliminating shared-counter contention. The architectural trade-off is that Moodycamel sacrifices strict global FIFO ordering across threads and requires dynamic chunk allocations.
+Every producer performs a CAS on `head_` and every consumer on `tail_`, so those cache lines move between cores on each claim. moodycamel avoids a single shared producer index with per-producer sub-queues, giving up global FIFO order and allocating memory as it grows. Truncated exponential backoff (the `MaxBackoff` parameter) gained about 20% at 4P:4C, which leaves most of the gap unexplained. Next steps are profiling cache-line transfers with hardware counters, and trying a `fetch_add`-based claim (which changes the full/empty semantics).
 
 ---
 
-## 5. Verification & Validation Framework
+## 5. Verification
 
-1. **ThreadSanitizer (TSan)**: Verified under GCC 13 and Clang 15 with `-fsanitize=thread`. TSan tracks the C++ memory-model happens-before graph and confirmed zero data races across all concurrent test interleavings.
-2. **Wrap-Around Chaos Suite**: 62,500 consecutive wrap-around laps over a tiny 16-slot ring buffer under high contention and randomized jitter to verify generational ticket correctness and memory reclamation.
-3. **Hardware Invariant TSC Calibration**: Latency measurements are calibrated against `std::chrono::steady_clock` to compute nominal reference frequency ($2.304011\text{ GHz} \implies 0.434026\text{ ns/tick}$), eliminating CPU turbo frequency distortions.
+1. **Exactly-once delivery:** multi-threaded tests sort what was received and compare it with what was sent.
+2. **Wrap-around stress:** one million messages through a 16-slot ring (62,500 laps), plus a run with randomized timing jitter.
+3. **ThreadSanitizer:** both suites on Linux. It checks only the interleavings that occur and is not a proof.
+4. **Timing:** benchmarks measure the TSC period against `steady_clock` at startup.

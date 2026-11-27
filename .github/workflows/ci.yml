@@ -52,12 +52,10 @@ jobs:
       - name: Run Stress & Chaos Suite
         run: ./build/tests/stress_tests
 
-      - name: Run Comparative Baseline Benchmarks
-        run: ./build/bench_comparison
-
       - name: Build and Run ThreadSanitizer (TSan)
         run: |
-          ./build/tests/tsan_tests
+          ./build/tests/tsan_unit_tests
+          ./build/tests/tsan_stress_tests
 
   arm64-cross-compile:
     name: AArch64 (ARM64) Cross-Compilation Check

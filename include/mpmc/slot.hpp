@@ -24,7 +24,7 @@ namespace detail {
 } // namespace detail
 
 /**
- * Cache-line aligned slot for the lock-free MPMC ring buffer.
+ * Cache-line aligned slot for the MPMC ring buffer.
  *
  * Each slot occupies EXACTLY 64 bytes (1 L1 Data cache line) and is aligned to a 64-byte boundary.
  *

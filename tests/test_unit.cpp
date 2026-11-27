@@ -1,7 +1,8 @@
 #include "mpmc/ring_buffer.hpp"
 #include "mpmc/pool.hpp"
 #include "mpmc/histogram.hpp"
-#include <cassert>
+#include "check.hpp"
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -67,7 +68,7 @@ void test_spsc() {
 
     // Verify ordering and integrity
     for (size_t i = 0; i < N; ++i) {
-        assert(received[i] == i + 1);
+        CHECK(received[i] == i + 1);
     }
 
     double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
@@ -150,8 +151,14 @@ void test_mpmc() {
         all_received.insert(all_received.end(), consumer_results[c].begin(), consumer_results[c].end());
     }
 
-    assert(received_count == TOTAL_MESSAGES);
-    assert(rb.empty_approx());
+    CHECK(received_count == TOTAL_MESSAGES);
+    std::sort(all_received.begin(), all_received.end());
+    for (size_t p = 0; p < PRODUCERS; ++p) {
+        for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
+            CHECK(all_received[p * N_PER_PRODUCER + i] == (p + 1) * 1'000'000'000ULL + i);
+        }
+    }
+    CHECK(rb.empty_approx());
 
     double ops_sec = (static_cast<double>(TOTAL_MESSAGES) / elapsed_ns) * 1e9;
     std::cout << "  - Processed " << TOTAL_MESSAGES << " messages across 4P:4C in " 
@@ -235,7 +242,7 @@ void test_bulk_operations() {
 
     // Verify all data intact
     for (size_t i = 0; i < TOTAL; ++i) {
-        assert(dest_data[i] == i + 1);
+        CHECK(dest_data[i] == i + 1);
     }
 
     double mops = (static_cast<double>(TOTAL) / (elapsed_ms / 1000.0)) / 1e6;
@@ -251,9 +258,9 @@ void test_pool_basic() {
     constexpr size_t POOL_CAP = 1024;
     ObjectPool<MarketOrder, POOL_CAP> pool;
 
-    assert(pool.capacity() == POOL_CAP);
-    assert(pool.available_approx() == POOL_CAP);
-    assert(pool.in_use_approx() == 0);
+    CHECK(pool.capacity() == POOL_CAP);
+    CHECK(pool.available_approx() == POOL_CAP);
+    CHECK(pool.in_use_approx() == 0);
 
     // Acquire all slots
     std::vector<MarketOrder*> acquired;
@@ -261,23 +268,23 @@ void test_pool_basic() {
 
     for (size_t i = 0; i < POOL_CAP; ++i) {
         MarketOrder* o = pool.acquire();
-        assert(o != nullptr);
+        CHECK(o != nullptr);
         o->order_id = 1000 + i;
         acquired.push_back(o);
     }
 
     // Pool must now be exhausted
     MarketOrder* extra = pool.acquire();
-    assert(extra == nullptr);
-    assert(pool.available_approx() == 0);
+    CHECK(extra == nullptr);
+    CHECK(pool.available_approx() == 0);
 
     // Release all slots back
     for (MarketOrder* o : acquired) {
         pool.release(o);
     }
 
-    assert(pool.available_approx() == POOL_CAP);
-    assert(pool.in_use_approx() == 0);
+    CHECK(pool.available_approx() == POOL_CAP);
+    CHECK(pool.in_use_approx() == 0);
     std::cout << "  - Capacity: " << POOL_CAP << " slots\n";
     std::cout << "  - Initial available: " << POOL_CAP << "\n";
     std::cout << "  - After full acquire: available=0 (exhausted)\n";
@@ -332,8 +339,8 @@ void test_pool_integration() {
     double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     uint64_t expected_checksum = static_cast<uint64_t>(TOTAL_ORDERS) * (TOTAL_ORDERS + 1) / 2;
-    assert(consumer_checksum == expected_checksum);
-    assert(pool.available_approx() == POOL_SIZE);
+    CHECK(consumer_checksum == expected_checksum);
+    CHECK(pool.available_approx() == POOL_SIZE);
 
     double mops = (static_cast<double>(TOTAL_ORDERS) / (elapsed_ms / 1000.0)) / 1e6;
     std::cout << "  - Processed " << TOTAL_ORDERS << " messages (pool acquire→queue→dequeue→pool release)\n";
@@ -401,8 +408,8 @@ void test_pool_mpmc() {
     auto t1 = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    assert(total_consumed.load() == TOTAL_OPS);
-    assert(pool.available_approx() == POOL_SIZE);
+    CHECK(total_consumed.load() == TOTAL_OPS);
+    CHECK(pool.available_approx() == POOL_SIZE);
 
     double mops = (static_cast<double>(TOTAL_OPS) / (elapsed_ms / 1000.0)) / 1e6;
     std::cout << "  - 4P:4C processed " << TOTAL_OPS << " items via pool+queue in " 
@@ -420,24 +427,24 @@ void test_crtp_drop_policy() {
     // Fill to capacity
     for (size_t i = 0; i < CAP; ++i) {
         bool ok = q.try_enqueue(i + 1);
-        assert(ok);
+        CHECK(ok);
     }
-    assert(q.size_approx() == CAP);
+    CHECK(q.size_approx() == CAP);
 
     // Next enqueue must be dropped (returns false), item NOT inserted
     bool dropped = q.try_enqueue(999);
-    assert(!dropped);
-    assert(q.size_approx() == CAP);
+    CHECK(!dropped);
+    CHECK(q.size_approx() == CAP);
 
     // Drain and verify only original CAP items present
     for (size_t i = 0; i < CAP; ++i) {
         uint64_t out = 0;
         bool ok = q.try_dequeue(out);
-        assert(ok);
-        assert(out == i + 1);
+        CHECK(ok);
+        CHECK(out == i + 1);
     }
     uint64_t dummy = 0;
-    assert(!q.try_dequeue(dummy));
+    CHECK(!q.try_dequeue(dummy));
     std::cout << "  - Full queue drop:    confirmed (try_enqueue returned false)\n";
     std::cout << "  - Empty queue signal: confirmed (try_dequeue returned false)\n";
     std::cout << "  - No items lost or duplicated across " << CAP << " slots\n";
@@ -470,7 +477,7 @@ void test_crtp_spinning_policy() {
         std::chrono::steady_clock::now() - t0).count();
 
     for (size_t i = 0; i < N; ++i) {
-        assert(results[i] == i + 1);
+        CHECK(results[i] == i + 1);
     }
 
     double ops_sec = (static_cast<double>(N) / elapsed_ns) * 1e9;
@@ -506,8 +513,8 @@ void test_inline_by_value_storage() {
     std::thread consumer([&]() {
         for (size_t i = 1; i <= N; ++i) {
             MarketOrder order = q.dequeue();
-            assert(order.order_id == i);
-            assert(order.flags == 0xAA);
+            CHECK(order.order_id == i);
+            CHECK(order.flags == 0xAA);
             total_checksum += order.order_id;
         }
     });
@@ -516,11 +523,29 @@ void test_inline_by_value_storage() {
     consumer.join();
 
     uint64_t expected_checksum = static_cast<uint64_t>(N) * (N + 1) / 2;
-    assert(total_checksum == expected_checksum);
+    CHECK(total_checksum == expected_checksum);
     std::cout << "  - Transferred " << N << " 40-byte MarketOrders inline by value\n";
-    std::cout << "  - Verified zero second cache misses (payload inline in slot)\n";
     std::cout << "  - Checksum: " << total_checksum << " (expected " << expected_checksum << ")\n";
     std::cout << "  [PASS] Inline by-value storage verified.\n";
+}
+
+void test_bulk_does_not_wait() {
+    std::cout << "[TEST] Bulk operations return partial counts instead of waiting...\n";
+    RingBuffer<uint64_t, 8> rb;
+    uint64_t in[16];
+    uint64_t out[16]{};
+    for (size_t i = 0; i < 16; ++i) in[i] = i + 1;
+
+    CHECK(rb.try_dequeue_bulk(out, 16) == 0);
+    CHECK(rb.try_enqueue_bulk(in, 5) == 5);
+    CHECK(rb.try_enqueue_bulk(in + 5, 11) == 3);  // only 3 slots left
+    CHECK(rb.try_enqueue_bulk(in, 1) == 0);       // full
+    CHECK(rb.try_dequeue_bulk(out, 3) == 3);
+    CHECK(rb.try_enqueue_bulk(in + 8, 8) == 3);   // wraps into freed slots
+    CHECK(rb.try_dequeue_bulk(out + 3, 13) == 8);
+    for (size_t i = 0; i < 11; ++i) CHECK(out[i] == i + 1);
+    CHECK(rb.empty_approx());
+    std::cout << "  [PASS] Bulk partial-count semantics verified.\n";
 }
 
 void test_histogram() {
@@ -530,7 +555,7 @@ void test_histogram() {
 
     for (uint64_t v = 1; v < 100'000'000ULL; v = v * 2 + 1) {
         size_t b = LatencyHistogram::value_to_bucket(v);
-        assert(b > 0);
+        CHECK(b > 0);
     }
 
     for (size_t i = 1; i <= 10000; ++i) {
@@ -539,8 +564,8 @@ void test_histogram() {
 
     uint64_t p50 = hist.percentile(50.0);
     uint64_t p99 = hist.percentile(99.0);
-    assert(p50 >= 4500 && p50 <= 5500);
-    assert(p99 >= 9500 && p99 <= 10300);
+    CHECK(p50 >= 4500 && p50 <= 5500);
+    CHECK(p99 >= 9500 && p99 <= 10300);
     std::cout << "  - Synthetic p50: " << p50 << " (expected ~5000)\n";
     std::cout << "  - Synthetic p99: " << p99 << " (expected ~9900)\n";
 
@@ -565,8 +590,8 @@ void test_histogram() {
 
     std::cout << "  --- Real RingBuffer RTT Percentile Distribution ---\n";
     rtt_hist.print_summary(std::cout, "ticks");
-    assert(rtt_hist.count() == PROFILING_SAMPLES);
-    assert(rtt_hist.percentile(50.0) > 0);
+    CHECK(rtt_hist.count() == PROFILING_SAMPLES);
+    CHECK(rtt_hist.percentile(50.0) > 0);
     std::cout << "  [PASS] Latency Histogram verified.\n";
 }
 
@@ -625,8 +650,8 @@ void test_cas_telemetry() {
     QueueStats total_p = aggregate_stats(p_stats);
     QueueStats total_c = aggregate_stats(c_stats);
 
-    assert(total_p.enqueue_success == TOTAL);
-    assert(total_c.dequeue_success == TOTAL);
+    CHECK(total_p.enqueue_success == TOTAL);
+    CHECK(total_c.dequeue_success == TOTAL);
 
     std::cout << "  --- Aggregated Producer Telemetry ---\n";
     total_p.print_summary(std::cout, "    ");
@@ -698,8 +723,8 @@ void test_bulk_cas_telemetry() {
     QueueStats total_p = aggregate_stats(p_stats);
     QueueStats total_c = aggregate_stats(c_stats);
 
-    assert(total_p.enqueue_success == TOTAL);
-    assert(total_c.dequeue_success == TOTAL);
+    CHECK(total_p.enqueue_success == TOTAL);
+    CHECK(total_c.dequeue_success == TOTAL);
 
     std::cout << "  --- Aggregated Bulk Producer Telemetry ---\n";
     total_p.print_summary(std::cout, "    ");
@@ -725,6 +750,7 @@ int main() {
     test_crtp_drop_policy();
     test_crtp_spinning_policy();
     test_inline_by_value_storage();
+    test_bulk_does_not_wait();
     test_histogram();
     test_cas_telemetry();
     test_bulk_cas_telemetry();

@@ -2,7 +2,8 @@
 #include "mpmc/pool.hpp"
 #include "mpmc/cache.hpp"
 
-#include <cassert>
+#include "check.hpp"
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -17,6 +18,7 @@ using namespace mpmc;
 // This forces the queue to wrap around 62,500 full circular laps in milliseconds.
 // Proves that sequence counter transitions (seq = pos -> pos + 1 -> pos + Capacity)
 // never drift, desynchronize, or suffer ABA degradation.
+template <uint32_t MaxBackoff>
 void test_rapid_laps_wrap_around() {
     std::cout << "[STRESS TEST 1] Rapid Laps & Sequence Invariant (Capacity = 16, 62,500 laps)...\n";
 
@@ -26,7 +28,7 @@ void test_rapid_laps_wrap_around() {
     constexpr size_t CONSUMERS       = 4;
     constexpr size_t N_PER_PRODUCER  = TOTAL_MESSAGES / PRODUCERS;
 
-    RingBuffer<uint64_t, TINY_CAPACITY> rb;
+    RingBuffer<uint64_t, TINY_CAPACITY, 64, 64, MaxBackoff> rb;
 
     std::vector<std::vector<uint64_t>> producer_payloads(PRODUCERS);
     for (size_t p = 0; p < PRODUCERS; ++p) {
@@ -85,8 +87,17 @@ void test_rapid_laps_wrap_around() {
         received += consumer_results[c].size();
     }
 
-    assert(received == TOTAL_MESSAGES);
-    assert(rb.empty_approx());
+    CHECK(received == TOTAL_MESSAGES);
+    std::vector<uint64_t> all;
+    all.reserve(received);
+    for (const auto& r : consumer_results) all.insert(all.end(), r.begin(), r.end());
+    std::sort(all.begin(), all.end());
+    for (size_t p = 0; p < PRODUCERS; ++p) {
+        for (size_t i = 0; i < N_PER_PRODUCER; ++i) {
+            CHECK(all[p * N_PER_PRODUCER + i] == producer_payloads[p][i]);
+        }
+    }
+    CHECK(rb.empty_approx());
     std::cout << "  - Completed " << TOTAL_MESSAGES / TINY_CAPACITY 
               << " full laps across " << TOTAL_MESSAGES << " messages in " 
               << elapsed_ms << " ms\n";
@@ -161,8 +172,8 @@ void test_asymmetric_jitter_chaos() {
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
 
-    assert(total_consumed.load() == TOTAL_MESSAGES);
-    assert(rb.empty_approx());
+    CHECK(total_consumed.load() == TOTAL_MESSAGES);
+    CHECK(rb.empty_approx());
     std::cout << "  - Processed " << TOTAL_MESSAGES << " items under random timing jitter in " 
               << elapsed_ms << " ms\n";
     std::cout << "  [PASS] Asymmetric chaos completed with zero deadlocks or lost messages.\n";
@@ -248,8 +259,8 @@ void test_pool_lifecycle_chaos() {
         std::chrono::steady_clock::now() - t0).count();
 
     uint64_t expected_checksum = static_cast<uint64_t>(TOTAL_ORDERS) * (TOTAL_ORDERS + 1) / 2;
-    assert(cumulative_checksum.load() == expected_checksum);
-    assert(total_processed.load() == TOTAL_ORDERS);
+    CHECK(cumulative_checksum.load() == expected_checksum);
+    CHECK(total_processed.load() == TOTAL_ORDERS);
     
     std::cout << "  - Processed " << TOTAL_ORDERS << " order lifecycles in " << elapsed_ms << " ms\n";
     std::cout << "  - Data checksum: " << cumulative_checksum.load() << " (verified)\n";
@@ -263,7 +274,8 @@ int main() {
     std::cout << "     HFT Lock-Free MPMC Ring Buffer Stress & Chaos Suite\n";
     std::cout << "========================================================\n";
 
-    test_rapid_laps_wrap_around();
+    test_rapid_laps_wrap_around<1>();
+    test_rapid_laps_wrap_around<64>();
     test_asymmetric_jitter_chaos();
     test_pool_lifecycle_chaos();
 
